@@ -1,0 +1,105 @@
+# Workflow : Pipeline IA — Analyse et réponse automatique aux tickets support
+# Déclencheur : événement "support.ticket_created"
+
+name: ai_support_pipeline
+version: "1.0.0"
+description: "Analyse IA automatique et réponse aux nouveaux tickets support"
+
+trigger:
+  type: event
+  event_name: support.ticket_created
+
+timeout_seconds: 120
+
+steps:
+  - id: classify_ticket
+    type: ai
+    service: classify
+    prompt: |
+      Classifie ce ticket support dans l'une des catégories : billing, technical, general, urgent.
+      Ticket : {{ trigger.subject }} — {{ trigger.body }}
+    on_success: route_by_category
+    on_failure: assign_to_human
+
+  - id: route_by_category
+    type: switch
+    expression: "{{ steps.classify_ticket.result.category }}"
+    cases:
+      billing: handle_billing
+      technical: handle_technical
+      urgent: escalate_urgent
+    default: handle_general
+
+  - id: handle_billing
+    type: action
+    plugin: billing
+    action: get_client_info
+    payload:
+      client_id: "{{ trigger.client_id }}"
+    on_success: generate_billing_response
+
+  - id: generate_billing_response
+    type: ai
+    service: summarize
+    prompt: "Rédige une réponse professionnelle pour ce ticket billing. Contexte : {{ steps.handle_billing.result }}"
+    on_success: send_auto_reply
+
+  - id: handle_technical
+    type: action
+    plugin: support
+    action: search_kb
+    payload:
+      query: "{{ trigger.subject }}"
+    on_success: send_auto_reply
+
+  - id: handle_general
+    type: action
+    plugin: support
+    action: ticket_assign
+    payload:
+      ticket_id: "{{ trigger.ticket_id }}"
+      team: general
+    on_success: send_auto_reply
+
+  - id: escalate_urgent
+    type: parallel
+    branches:
+      - [notify_manager]
+      - [send_urgent_sms]
+    wait_all: true
+    on_success: send_auto_reply
+
+  - id: notify_manager
+    type: action
+    plugin: notification
+    action: push
+    payload:
+      channel: managers
+      message: "URGENT : ticket #{{ trigger.ticket_id }} — {{ trigger.subject }}"
+
+  - id: send_urgent_sms
+    type: action
+    plugin: notification
+    action: sms
+    payload:
+      to: "{{ trigger.client_phone }}"
+      message: "Votre ticket urgent a été reçu. Notre équipe vous contacte dans 30 minutes."
+
+  - id: send_auto_reply
+    type: action
+    plugin: mail
+    action: send
+    payload:
+      to: "{{ trigger.client_email }}"
+      template: support_auto_reply
+      context:
+        ticket_id: "{{ trigger.ticket_id }}"
+    on_success: END
+
+  - id: assign_to_human
+    type: action
+    plugin: support
+    action: ticket_assign
+    payload:
+      ticket_id: "{{ trigger.ticket_id }}"
+      team: tier2

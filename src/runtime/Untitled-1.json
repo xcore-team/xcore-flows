@@ -1,0 +1,25 @@
+{
+  "name": "`push`",
+  "version": "1.0.0",
+  "description": "Envoie une notification realtime via XPulse en déclenchement manuel",
+  "trigger": {
+    "type": "manual"
+  },
+  "steps": [
+    {
+      "id": "push_notification",
+      "type": "action",
+      "plugin": "XPulse",
+      "action": "xpulse.publish",
+      "payload": {
+        "channel": "hunters",
+        "event": {
+          "user_id": "{{ trigger.user_id }}",
+          "title": "{{ trigger.title }}",
+          "text": "{{ trigger.message }}",
+          "type": "{{ trigger.type }}"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+# XFlow V2 — Dépendances
+# Compatible Python 3.12+
+
+# Web & async
+httpx>=0.27.0
+pydantic>=2.7.0
+fastapi>=0.111.0
+
+# ORM / DB
+sqlalchemy>=2.0.30
+alembic>=1.13.0
+
+# Templates
+jinja2>=3.1.4
+pyyaml>=6.0.1
+
+# Optionnel : Redis (si dispo dans l'env XCore)
+redis>=5.0.4
+
+# Scheduling (si APScheduler utilisé dans XCore)
+apscheduler>=3.10.4
+
+# Tests
+pytest>=8.2.0
+pytest-asyncio>=0.23.6

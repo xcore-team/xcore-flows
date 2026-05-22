@@ -1,0 +1,65 @@
+name: xflow
+version: "1.0.0"
+author: xcore-team
+description: >
+  Moteur de workflows IPC centralisé. Orchestre des séquences d'actions
+  cross-plugins avec conditions, retries, scheduling et webhooks.
+execution_mode: trusted
+framework_version: ">=2.0"
+entry_point: src/main.py
+
+#requires:
+#  - name: auth
+#    version: 0.1.0
+
+permissions:
+  - resource: "xflow.integration"
+    actions: ['*']
+    effect: allow
+  - resource: "registry"
+    actions: ["read", "write", "execute"]
+    effect: allow
+  - resource: "xflow.unregister"
+    actions: ["read", "write", "execute"]
+    effect: allow
+  - resource: "xflow.trigger"
+    actions: ["read", "write", "execute"]
+    effect: allow
+  - resource: "xflow.get_run"
+    actions: ["read", "write", "execute"]
+    effect: allow
+  - resource: "xflow.list_runs"
+    actions: ["read", "write", "execute"]
+    effect: allow
+  - resource: "xflow.cancel_run"
+    actions: ["read", "write", "execute"]
+    effect: allow
+  - resource: "xflow.list_workflows"
+    actions: ["read", "write", "execute"]
+    effect: allow
+  - resource: "db.*"
+    actions: ["read", "write", "delete"]
+    effect: allow
+  - resource: "cache.*"
+    actions: ["read", "write", "delete"]
+    effect: allow
+  - resource: "scheduler.*"
+    actions: ["read", "write", "delete"]
+    effect: allow
+  - resource: "plugins.*"
+    actions: ["call"]
+    effect: allow
+
+resources:
+  timeout_seconds: 300
+  max_memory_mb: 512
+  rate_limit:
+    calls: 500
+    period_seconds: 60
+
+filesystem:
+  allowed_paths:
+    - data/
+  denied_paths:
+    - src/
+    - /

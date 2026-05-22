@@ -1,0 +1,58 @@
+# Workflow : Relance automatique des factures impayées
+# Déclencheur : cron quotidien à 9h00
+
+name: relance_facture
+version: "1.0.0"
+description: "Relance automatique quotidienne des factures en retard de paiement"
+
+trigger:
+  type: schedule
+  cron: "0 9 * * *"
+
+steps:
+  - id: get_overdue
+    type: action
+    plugin: billing
+    action: overdue_list
+    payload:
+      days_overdue: 7
+    on_success: check_has_items
+
+  - id: check_has_items
+    type: condition
+    condition:
+      left: "{{ steps.get_overdue.result.count }}"
+      operator: ">"
+      right: "0"
+    if_true: iterate_invoices
+    if_false: END
+
+  - id: iterate_invoices
+    type: foreach
+    items: "{{ steps.get_overdue.result.invoices }}"
+    steps:
+      - send_reminder
+    on_success: log_done
+
+  - id: send_reminder
+    type: action
+    plugin: mail
+    action: send
+    payload:
+      to: "{{ loop_item.client_email }}"
+      template: invoice_reminder
+      context:
+        invoice_id: "{{ loop_item.id }}"
+        amount: "{{ loop_item.amount }}"
+        due_date: "{{ loop_item.due_date }}"
+    retry:
+      max_attempts: 2
+      delay_seconds: 30
+
+  - id: log_done
+    type: action
+    plugin: support
+    action: log
+    payload:
+      message: "Relances envoyées pour {{ steps.get_overdue.result.count }} factures"
+      category: billing_reminder

@@ -1,0 +1,66 @@
+# Workflow : Onboarding client complet
+# Déclencheur : événement "client.created" émis par n'importe quel plugin
+
+name: onboarding_client
+version: "1.0.0"
+description: "Séquence complète d'onboarding lors de la création d'un nouveau client"
+
+trigger:
+  type: event
+  event_name: client.created
+
+steps:
+  - id: create_workspace
+    type: action
+    plugin: users
+    action: create_workspace
+    payload:
+      client_id: "{{ trigger.client_id }}"
+      plan: "{{ trigger.plan }}"
+    on_success: send_welcome_mail
+    on_failure: notify_admin_error
+
+  - id: send_welcome_mail
+    type: action
+    plugin: mail
+    action: send
+    payload:
+      to: "{{ trigger.email }}"
+      template: welcome_new_client
+      context:
+        name: "{{ trigger.name }}"
+        workspace_url: "{{ steps.create_workspace.result.url }}"
+    on_success: create_trial
+    retry:
+      max_attempts: 3
+      delay_seconds: 10
+      backoff: exponential
+
+  - id: create_trial
+    type: action
+    plugin: billing
+    action: create_trial
+    payload:
+      client_id: "{{ trigger.client_id }}"
+      days: 14
+    on_success: push_notification
+    on_failure: send_welcome_mail
+
+  - id: push_notification
+    type: action
+    plugin: notification
+    action: push
+    payload:
+      user_id: "{{ trigger.owner_id }}"
+      message: "Bienvenue ! Votre espace de travail est prêt."
+      type: success
+    on_success: END
+
+  - id: notify_admin_error
+    type: action
+    plugin: notification
+    action: push
+    payload:
+      channel: admin
+      message: "Erreur onboarding client {{ trigger.client_id }}"
+      type: error
