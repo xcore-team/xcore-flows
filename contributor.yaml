@@ -1,0 +1,27 @@
+name: "xauth"
+description: "Plugin d'authentification enterprise — multi-tenant, RBAC, audit log, invitations, MFA TOTP, JWT RS256, OAuth."
+author: "Xcore team"
+email: "contact@xcorehub.dev"
+github: "https://github.com/xcore-team/xauth"
+license: "MIT"
+version: "1.0.0"
+
+contributors:
+  - name: "Eliezer Traore"
+    role: "Mainteneur principal"
+    github: "traoreera"
+    email: "traoreera@gmail.com"
+    areas:
+      - authentication
+      - oauth
+      - rbac
+      - mfa
+      - audit
+
+  - name: "Xcore"
+    role: "Organisation"
+    github: "xcore-team"
+    email: "xcore@xcorehub.dev"
+    areas:
+      - review
+      - merge
