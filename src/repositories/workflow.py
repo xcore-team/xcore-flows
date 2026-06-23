@@ -43,11 +43,11 @@ class WorkflowStore:
     # Cache Keys
     # ------------------------------------------------------------------
 
-    def _workflow_cache_key(self, name: str) -> str:
-        return f"xflow:workflow:{name}"
+    def _workflow_cache_key(self, tenant_id: str, name: str) -> str:
+        return f"xflow:{tenant_id}:workflow:{name}"
 
-    def _workflow_list_cache_key(self) -> str:
-        return "xflow:workflow:list"
+    def _workflow_list_cache_key(self, tenant_id: str) -> str:
+        return f"xflow:{tenant_id}:workflow:list"
 
     def _run_cache_key(self, run_id: str) -> str:
         return f"xflow:run:{run_id}"
@@ -59,18 +59,23 @@ class WorkflowStore:
     # Workflow Definitions
     # ------------------------------------------------------------------
 
-    async def save_definition(self, definition: WorkflowDefinition) -> WorkflowDefinition:
+    async def save_definition(self, tenant_id: str, definition: WorkflowDefinition) -> WorkflowDefinition:
         payload = self._serialize_definition(definition)
 
         async with self._db.session() as session:
             result = await session.execute(
-                select(FlowRecord).where(FlowRecord.name == definition.name)
+                select(FlowRecord).where(
+                    FlowRecord.tenant_id == tenant_id,
+                    FlowRecord.name == definition.name,
+                )
             )
             flow = result.scalar_one_or_none()
 
             if flow is None:
                 flow = FlowRecord(
-                    name=definition.name, description=definition.description
+                    tenant_id=tenant_id,
+                    name=definition.name,
+                    description=definition.description,
                 )
                 session.add(flow)
                 await session.flush()
@@ -86,13 +91,13 @@ class WorkflowStore:
             session.add(version_record)
             await session.commit()
 
-        await self._cache_definition(definition)
-        await self._invalidate_workflow_lists(definition.trigger.event_name)
+        await self._cache_definition(tenant_id, definition)
+        await self._invalidate_workflow_lists(tenant_id, definition.trigger.event_name)
         return definition
 
-    async def get_definition(self, workflow_name: str) -> Optional[WorkflowDefinition]:
+    async def get_definition(self, tenant_id: str, workflow_name: str) -> Optional[WorkflowDefinition]:
         if self._cache:
-            cached = await self._cache.get(self._workflow_cache_key(workflow_name))
+            cached = await self._cache.get(self._workflow_cache_key(tenant_id, workflow_name))
             if cached:
                 return WorkflowDefinition.model_validate(cached)
 
@@ -100,7 +105,10 @@ class WorkflowStore:
             result = await session.execute(
                 select(FlowVersionRecord)
                 .join(FlowRecord)
-                .where(FlowRecord.name == workflow_name)
+                .where(
+                    FlowRecord.tenant_id == tenant_id,
+                    FlowRecord.name == workflow_name,
+                )
                 .order_by(desc(FlowVersionRecord.created_at))
             )
             record = result.scalars().first()
@@ -108,14 +116,16 @@ class WorkflowStore:
                 return None
             definition = WorkflowDefinition.model_validate(record.definition)
 
-        await self._cache_definition(definition)
+        await self._cache_definition(tenant_id, definition)
         return definition
 
-    async def delete_definition(self, workflow_name: str) -> bool:
-        """Supprime complètement un workflow et ses versions de la DB."""
+    async def delete_definition(self, tenant_id: str, workflow_name: str) -> bool:
         async with self._db.session() as session:
             result = await session.execute(
-                select(FlowRecord).where(FlowRecord.name == workflow_name)
+                select(FlowRecord).where(
+                    FlowRecord.tenant_id == tenant_id,
+                    FlowRecord.name == workflow_name,
+                )
             )
             flow = result.scalar_one_or_none()
             if flow is None:
@@ -124,13 +134,13 @@ class WorkflowStore:
             await session.commit()
 
         if self._cache:
-            await self._cache.delete(self._workflow_cache_key(workflow_name))
-            await self._cache.delete(self._workflow_list_cache_key())
+            await self._cache.delete(self._workflow_cache_key(tenant_id, workflow_name))
+            await self._cache.delete(self._workflow_list_cache_key(tenant_id))
         return True
 
-    async def list_definitions(self) -> List[WorkflowDefinition]:
+    async def list_definitions(self, tenant_id: str) -> List[WorkflowDefinition]:
         if self._cache:
-            cached = await self._cache.get(self._workflow_list_cache_key())
+            cached = await self._cache.get(self._workflow_list_cache_key(tenant_id))
             if cached:
                 return [WorkflowDefinition.model_validate(item) for item in cached]
 
@@ -138,6 +148,8 @@ class WorkflowStore:
             stmt = (
                 select(FlowVersionRecord)
                 .options(selectinload(FlowVersionRecord.flow))
+                .join(FlowRecord)
+                .where(FlowRecord.tenant_id == tenant_id)
                 .order_by(desc(FlowVersionRecord.created_at))
             )
             result = await session.execute(stmt)
@@ -152,14 +164,14 @@ class WorkflowStore:
 
         if self._cache:
             await self._cache.set(
-                self._workflow_list_cache_key(),
+                self._workflow_list_cache_key(tenant_id),
                 [self._serialize_definition(d) for d in definitions],
                 ttl=WORKFLOW_CACHE_TTL,
             )
         return definitions
 
-    async def list_event_definitions(self, event_name: str) -> List[WorkflowDefinition]:
-        all_defs = await self.list_definitions()
+    async def list_event_definitions(self, tenant_id: str, event_name: str) -> List[WorkflowDefinition]:
+        all_defs = await self.list_definitions(tenant_id)
         return [
             d
             for d in all_defs
@@ -177,6 +189,7 @@ class WorkflowStore:
                 select(FlowVersionRecord)
                 .join(FlowRecord)
                 .where(
+                    FlowRecord.tenant_id == run.tenant_id,
                     FlowRecord.name == run.workflow_name,
                     FlowVersionRecord.version_tag == run.workflow_version,
                 )
@@ -187,6 +200,7 @@ class WorkflowStore:
             if record is None:
                 record = FlowRunRecord(
                     run_id=run.run_id,
+                    tenant_id=run.tenant_id,
                     version_id=version.id if version else None,
                     status=run.status.value,
                     trigger_type=run.context.get("_triggered_by", "manual"),
@@ -201,7 +215,6 @@ class WorkflowStore:
                 record.error = run.error
                 record.finished_at = run.finished_at
 
-            # Upsert steps
             for sid, srun in run.steps.items():
                 s_res = await session.execute(
                     select(FlowStepRecord).where(
@@ -278,6 +291,7 @@ class WorkflowStore:
 
             run = WorkflowRun(
                 run_id=record.run_id,
+                tenant_id=record.tenant_id,
                 workflow_name=flow_name,
                 workflow_version=version_tag,
                 status=WorkflowStatus(record.status),
@@ -298,11 +312,12 @@ class WorkflowStore:
         return run
 
     async def list_runs(
-        self, workflow_name: Optional[str] = None, limit: int = 50
+        self, tenant_id: str, workflow_name: Optional[str] = None, limit: int = 50
     ) -> List[WorkflowRun]:
         async with self._db.session() as session:
             stmt = (
                 select(FlowRunRecord.run_id)
+                .where(FlowRunRecord.tenant_id == tenant_id)
                 .order_by(desc(FlowRunRecord.created_at))
                 .limit(limit)
             )
@@ -321,6 +336,15 @@ class WorkflowStore:
             if run:
                 runs.append(run)
         return runs
+
+    async def list_crashed_runs(self) -> List[tuple[str, str]]:
+        """Retourne les (run_id, tenant_id) des runs RUNNING au dernier arrêt."""
+        async with self._db.session() as session:
+            stmt = select(FlowRunRecord.run_id, FlowRunRecord.tenant_id).where(
+                FlowRunRecord.status == WorkflowStatus.RUNNING.value
+            )
+            result = await session.execute(stmt)
+            return result.all()
 
     # ------------------------------------------------------------------
     # Dead-letter queue
@@ -358,18 +382,18 @@ class WorkflowStore:
     # Private helpers
     # ------------------------------------------------------------------
 
-    async def _cache_definition(self, definition: WorkflowDefinition) -> None:
+    async def _cache_definition(self, tenant_id: str, definition: WorkflowDefinition) -> None:
         if not self._cache:
             return
         await self._cache.set(
-            self._workflow_cache_key(definition.name),
+            self._workflow_cache_key(tenant_id, definition.name),
             self._serialize_definition(definition),
             ttl=WORKFLOW_CACHE_TTL,
         )
 
-    async def _invalidate_workflow_lists(self, event_name: Optional[str]) -> None:
+    async def _invalidate_workflow_lists(self, tenant_id: str, event_name: Optional[str]) -> None:
         if not self._cache:
             return
-        await self._cache.delete(self._workflow_list_cache_key())
+        await self._cache.delete(self._workflow_list_cache_key(tenant_id))
         if event_name:
-            await self._cache.delete(f"xflow:event:{event_name}")
+            await self._cache.delete(f"xflow:{tenant_id}:event:{event_name}")

@@ -27,7 +27,7 @@ class AIWorkflowGenerator:
         Génère une définition de workflow JSON depuis un prompt utilisateur.
         Injecte le catalogue d'actions disponibles dans le contexte IA.
         """
-        available_actions = self.discovery.list_availabactions_contextle_actions()
+        available_actions = self.discovery.list_available_actions()
         actions_context = "\n".join([
             f"- {a['qualified_name']}: {a['description']} | inputs: {json.dumps(a['input_schema'])}"
             for a in available_actions

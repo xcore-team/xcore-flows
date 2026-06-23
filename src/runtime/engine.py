@@ -67,12 +67,14 @@ class WorkflowEngine:
     async def init_run(
         self,
         definition: WorkflowDefinition,
+        tenant_id: str = "default",
         trigger_payload: Optional[Dict[str, Any]] = None,
         trigger_type: str = "manual",
     ) -> WorkflowRun:
         """Crée et persiste un run en statut PENDING."""
         run = WorkflowRun(
             run_id=str(uuid.uuid4()),
+            tenant_id=tenant_id,
             workflow_name=definition.name,
             workflow_version=definition.version,
             status=WorkflowStatus.PENDING,
@@ -242,7 +244,6 @@ class WorkflowEngine:
             result = await execute_with_retry(call_action, step.retry)
             step_run.status = StepStatus.SUCCESS
 
-            print('data:', result)
             step_run.result = result.get("result") if isinstance(result, dict) else result
             run.context.setdefault("steps", {})[step.id] = {"result": step_run.result}
             await self._emit("workflow.step.success", run, {"step_id": step.id})

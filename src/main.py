@@ -18,10 +18,9 @@ import asyncio
 import json
 import logging
 from typing import Any, Dict, List, Optional
-
-from pydantic import BaseModel
+from pathlib import Path
 from sqlalchemy import select
-
+from .repositories.models import Base
 from .repositories import FlowRunRecord
 from .runtime import WorkflowEngine
 from .schemas import TriggerType, WorkflowDefinition, WorkflowStatus
@@ -40,45 +39,9 @@ logger = logging.getLogger("xflow")
 
 XFLOW_QUEUE = "xflow:queue:tasks"
 
-# ---------------------------------------------------------------------------
-# SDK imports — adaptés à la structure réelle de XCore
-# ---------------------------------------------------------------------------
-from xcore.sdk import AutoDispatchMixin, RoutedPlugin, TrustedBase, action, route, validate_payload
+from xcore.sdk import AutoDispatchMixin, RoutedPlugin, TrustedBase, action, route, schema, get_logger
 
-# ---------------------------------------------------------------------------
-# Payload schemas
-# ---------------------------------------------------------------------------
-
-class RegisterPayload(BaseModel):
-    definition: Dict[str, Any]
-
-
-class TriggerPayload(BaseModel):
-    workflow_name: str
-    payload: Dict[str, Any] = {}
-
-
-class UnregisterPayload(BaseModel):
-    workflow_name: str
-
-
-class GetRunPayload(BaseModel):
-    run_id: str
-
-
-class CancelRunPayload(BaseModel):
-    run_id: str
-
-
-class ListRunsPayload(BaseModel):
-    workflow_name: Optional[str] = None
-    limit: int = 50
-
-
-class AIGeneratePayload(BaseModel):
-    prompt: str
-
-
+logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Plugin principal XFlow V2
 # ---------------------------------------------------------------------------
@@ -91,28 +54,41 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
         on_load  → initialise DB, engine, discovery, scheduler, workers
         on_unload → arrête proprement worker task et jobs schedulés
     """
-    
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+    async def _initialize_tables(self, db) -> None:
+        import logging as _log
 
+        from xcore.services.database.migrations import MigrationRunner
+        logger.info("Tables créées / vérifiées")
+        migrations_dir = Path(__file__).parent.parent / "migrations"
+        runner = MigrationRunner(db_url=str(db.engine.url), migrations_dir=migrations_dir)
+        try:
+            await runner.init(autogenerate=False, message="first_initialisation")
+            await runner.upgrade()
+        except Exception as exc:
+            logger.warning("[xauth] Migration upgrade ignorée : %s", exc)
+    
     async def on_load(self) -> None:
         logger.info("Initialisation de XFlow V2...")
-        
+
         self.db = self.get_service("db")
         self._queue_client = self._init_queue_client()
 
+        await self._initialize_tables(self.db)
+
         await self._create_tables()
 
-        from .repositories import WorkflowStore  # local import pour éviter cycle
+        from .repositories import WorkflowStore
         self._store = WorkflowStore(self.db, self._queue_client if self._has_redis else None)
         self._engine = WorkflowEngine(self)
-        # Expose _enqueue_run_id sur l'engine pour le scheduler
         self._engine._enqueue_run_id = self._enqueue_run_id  # type: ignore[attr-defined]
         await self._engine.setup(self._store)
 
-        self._discovery = DiscoveryService(self)
+        self._discovery = DiscoveryService()
+        self._discovery.load()
 
         try:
             sched_svc = self.get_service("scheduler")
@@ -126,21 +102,14 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
 
         self._ai_gen = AIWorkflowGenerator(self, self._discovery)
 
-        # Initialiser les services composites et events
         self._composite_service = CompositeService(self.db)
         self._event_catalog = EventCatalogService(self.ctx)
         asyncio.create_task(self._event_catalog.discover_events())
 
-        # Abonnement global EventBus
         self.ctx.events.on("*", self._on_any_event)
 
-        # Scan initial des plugins actifs
-        asyncio.create_task(self._discovery.scan_all_plugins())
-
-        # Crash recovery
         await self._resume_crashed_runs()
 
-        # Démarrage du worker loop
         self._worker_task = asyncio.create_task(self._worker_loop())
 
         logger.info("XFlow V2 prêt.")
@@ -164,10 +133,8 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
     # ------------------------------------------------------------------
 
     def _init_queue_client(self) -> Any:
-        """Retourne le client Redis si disponible, sinon une queue locale."""
         try:
             cache = self.get_service("cache")
-            # Vérification rapide que c'est bien un vrai client Redis
             if hasattr(cache, "lpush") and hasattr(cache, "rpop"):
                 self._has_redis = True
                 return cache
@@ -184,22 +151,15 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
 
     async def _resume_crashed_runs(self) -> None:
         """Requeue les runs qui étaient RUNNING lors du dernier arrêt."""
-        async with self.db.session() as session:
-            stmt = select(FlowRunRecord.run_id).where(
-                FlowRunRecord.status == WorkflowStatus.RUNNING.value
-            )
-            result = await session.execute(stmt)
-            run_ids = result.scalars().all()
-
-        for rid in run_ids:
-            logger.info("Reprise du run crashé: %s", rid)
-            await self._enqueue_run_id(rid)
+        crashed = await self._store.list_crashed_runs()
+        for run_id, _tenant_id in crashed:
+            logger.info("Reprise du run crashé: %s (tenant=%s)", run_id, _tenant_id)
+            await self._enqueue_run_id(run_id)
 
     async def _enqueue_run_id(self, run_id: str) -> None:
         await self._queue_client.lpush(XFLOW_QUEUE, json.dumps({"run_id": run_id}))
 
     async def _worker_loop(self) -> None:
-        """Consommateur principal de la queue de runs."""
         logger.info("Worker XFlow démarré (mode: %s).", "redis" if self._has_redis else "local")
         while True:
             try:
@@ -218,7 +178,7 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
                     logger.warning("Run introuvable: %s", run_id)
                     continue
 
-                definition = await self._registry.get(run.workflow_name)
+                definition = await self._registry.get(run.tenant_id, run.workflow_name)
                 if not definition:
                     logger.error("Définition introuvable pour le run %s (%s)", run_id, run.workflow_name)
                     continue
@@ -252,21 +212,35 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
 
     @action("register")
     @action("deploy")
-    @validate_payload(RegisterPayload)
+    @schema(
+        version="1.0",
+        input={"tenant_id": (str, ...), "definition": (dict, ...)},
+        output={"workflow_name": str, "message": str},
+        type_response="dict",
+        unset=False,
+    )
     async def ipc_register(self, payload: Dict[str, Any]) -> dict:
         try:
+            tenant_id = payload["tenant_id"]
             definition = WorkflowDefinition(**payload["definition"])
-            definition = await self._registry.register(definition)
+            definition = await self._registry.register(tenant_id, definition)
             return self._ok(workflow_name=definition.name, message="Workflow déployé avec succès.")
         except Exception as e:
             logger.exception("Erreur lors de l'enregistrement du workflow")
             return self._error(str(e), code="register_error")
 
     @action("unregister")
-    @validate_payload(UnregisterPayload)
+    @schema(
+        version="1.0",
+        input={"tenant_id": (str, ...), "workflow_name": (str, ...)},
+        output={"message": str},
+        type_response="dict",
+        unset=False,
+    )
     async def ipc_unregister(self, payload: Dict[str, Any]) -> dict:
         try:
-            definition = await self._registry.unregister(payload["workflow_name"])
+            tenant_id = payload["tenant_id"]
+            definition = await self._registry.unregister(tenant_id, payload["workflow_name"])
             if not definition:
                 return self._error(f"Workflow '{payload['workflow_name']}' introuvable.", code="not_found")
             return self._ok(message=f"Workflow '{definition.name}' supprimé.")
@@ -275,15 +249,23 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
 
     @action("run")
     @action("trigger")
-    @validate_payload(TriggerPayload)
+    @schema(
+        version="1.0",
+        input={"tenant_id": (str, ...), "workflow_name": (str, ...), "payload": (dict, {})},
+        output={"run_id": str, "status": str},
+        type_response="dict",
+        unset=False,
+    )
     async def ipc_trigger(self, payload: Dict[str, Any]) -> dict:
+        tenant_id = payload["tenant_id"]
         name = payload["workflow_name"]
-        definition = await self._registry.get(name)
+        definition = await self._registry.get(tenant_id, name)
         if not definition:
             return self._error(f"Workflow '{name}' inconnu.", code="not_found")
 
         run = await self._engine.init_run(
             definition,
+            tenant_id=tenant_id,
             trigger_payload=payload.get("payload", {}),
             trigger_type="ipc",
         )
@@ -291,17 +273,34 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
         return self._ok(run_id=run.run_id, status=run.status.value)
 
     @action("get_run")
-    @validate_payload(GetRunPayload)
+    @schema(
+        version="1.0",
+        input={"tenant_id": (str, ...), "run_id": (str, ...)},
+        output={"run": dict},
+        type_response="dict",
+        unset=False,
+    )
     async def ipc_get_run(self, payload: Dict[str, Any]) -> dict:
         run = await self._store.get_run(payload["run_id"])
         if not run:
+            return self._error("Run introuvable.", code="not_found")
+        if run.tenant_id != payload["tenant_id"]:
             return self._error("Run introuvable.", code="not_found")
         return self._ok(run=run.model_dump(mode="json"))
 
     @action("executions")
     @action("list_runs")
+    @schema(
+        version="1.0",
+        input={"tenant_id": (str, ...), "workflow_name": (Optional[str], None), "limit": (int, 50)},
+        output={"runs": list},
+        type_response="dict",
+        unset=False,
+    )
     async def ipc_list_runs(self, payload: Dict[str, Any]) -> dict:
+        tenant_id = payload["tenant_id"]
         runs = await self._store.list_runs(
+            tenant_id=tenant_id,
             workflow_name=payload.get("workflow_name"),
             limit=int(payload.get("limit", 50)),
         )
@@ -309,14 +308,31 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
 
     @action("cancel_run")
     @action("pause")
-    @validate_payload(CancelRunPayload)
+    @schema(
+        version="1.0",
+        input={"tenant_id": (str, ...), "run_id": (str, ...)},
+        output={"success": bool},
+        type_response="dict",
+        unset=False,
+    )
     async def ipc_cancel_run(self, payload: Dict[str, Any]) -> dict:
+        run = await self._store.get_run(payload["run_id"])
+        if not run or run.tenant_id != payload["tenant_id"]:
+            return self._error("Run introuvable.", code="not_found")
         success = await self._engine.cancel_run(payload["run_id"])
         return self._ok(success=success)
 
     @action("list_workflows")
+    @schema(
+        version="1.0",
+        input={"tenant_id": (str, ...)},
+        output={"workflows": list},
+        type_response="dict",
+        unset=False,
+    )
     async def ipc_list_workflows(self, payload: Dict[str, Any]) -> dict:
-        defs = await self._registry.list_all()
+        tenant_id = payload["tenant_id"]
+        defs = await self._registry.list_all(tenant_id)
         return self._ok(
             workflows=[
                 {
@@ -331,11 +347,18 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
         )
 
     @action("registry")
+    @schema(version="1.0", output={"actions": list})
     async def ipc_registry(self, payload: Dict[str, Any]) -> dict:
         return self._ok(actions=self._discovery.list_available_actions())
 
     @action("ai_generate")
-    @validate_payload(AIGeneratePayload)
+    @schema(
+        version="1.0",
+        input={"prompt": (str, ...)},
+        output={"workflow": dict},
+        type_response="dict",
+        unset=False,
+    )
     async def ipc_ai_generate(self, payload: Dict[str, Any]) -> dict:
         try:
             workflow = await self._ai_gen.generate_from_prompt(payload["prompt"])
@@ -344,8 +367,8 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
             return self._error(str(e), code="ai_error")
 
     @action("xflow_integration")
+    @schema(version="1.0", output={"ipc_actions": list})
     async def ipc_xflow_integration(self, payload: Dict[str, Any]) -> dict:
-        """Contrat d'intégration XFlow — permet à XFlow de se découvrir lui-même."""
         return self._ok(
             ipc_actions=[
                 {"name": "register", "description": "Enregistrer un workflow"},
@@ -368,30 +391,36 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
     # ------------------------------------------------------------------
 
     @action("composite.register")
+    @schema(version="1.0", input={"tenant_id": (str, ...), "name": (str, ...), "steps": (list, [])}, output={"name": str, "version": str, "message": str})
     async def ipc_composite_register(self, payload: Dict[str, Any]) -> dict:
-        """Enregistre un composite node."""
         try:
-            definition = CompositeNodeDefinition(**payload)
-            saved = await self._composite_service.create(definition)
-            return self._ok(
-                name=saved.name,
-                version=saved.version,
-                message="Composite node enregistré."
-            )
+            tenant_id = payload.get("tenant_id")
+            if not tenant_id:
+                return self._error("tenant_id requis.", code="missing_tenant")
+            definition = CompositeNodeDefinition(**{k: v for k, v in payload.items() if k != "tenant_id"})
+            saved = await self._composite_service.create(tenant_id, definition)
+            return self._ok(name=saved.name, version=saved.version, message="Composite node enregistré.")
         except Exception as e:
             logger.exception("Erreur enregistrement composite")
             return self._error(str(e), code="composite_register_error")
 
     @action("composite.list")
+    @schema(version="1.0", input={"tenant_id": (str, ...)}, output={"composites": list})
     async def ipc_composite_list(self, payload: Dict[str, Any]) -> dict:
-        """Liste tous les composites disponibles."""
-        composites = await self._composite_service.list_all()
+        tenant_id = payload.get("tenant_id")
+        if not tenant_id:
+            return self._error("tenant_id requis.", code="missing_tenant")
+        composites = await self._composite_service.list_all(tenant_id)
         return self._ok(composites=[c.model_dump(mode="json") for c in composites])
 
     @action("composite.expand")
+    @schema(version="1.0", input={"tenant_id": (str, ...), "composite_name": (str, ...), "instance_id": (str, "instance"), "inputs": (dict, {})}, output={"expansion": dict})
     async def ipc_composite_expand(self, payload: Dict[str, Any]) -> dict:
-        """Étend un composite en ses steps internes pour exécution."""
+        tenant_id = payload.get("tenant_id")
+        if not tenant_id:
+            return self._error("tenant_id requis.", code="missing_tenant")
         result = await self._composite_service.expand_composite(
+            tenant_id=tenant_id,
             composite_name=payload.get("composite_name"),
             instance_id=payload.get("instance_id", "instance"),
             inputs=payload.get("inputs", {}),
@@ -405,69 +434,70 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
     # ------------------------------------------------------------------
 
     @action("events.list")
+    @schema(version="1.0", output={"events": list})
     async def ipc_events_list(self, payload: Dict[str, Any]) -> dict:
-        """Liste tous les événements disponibles dans le catalogue."""
         events = self._event_catalog.list_events()
         return self._ok(events=[e.model_dump(mode="json") for e in events])
 
     # ------------------------------------------------------------------
-    # HTTP Routes
+    # HTTP Routes  (tenant_id = query param obligatoire)
     # ------------------------------------------------------------------
 
     @route("/flows", method="GET", tags=["xflow"])
-    async def http_list_flows(self) -> dict:
-        return await self.ipc_list_workflows({})
+    async def http_list_flows(self, tenant_id: str) -> dict:
+        return await self.ipc_list_workflows({"tenant_id": tenant_id})
 
     @route("/flows", method="POST", tags=["xflow"])
-    async def http_deploy(self, body: Dict[str, Any]) -> dict:
-        return await self.ipc_register({"definition": body})
+    async def http_deploy(self, tenant_id: str, body: Dict[str, Any]) -> dict:
+        return await self.ipc_register({"tenant_id": tenant_id, "definition": body})
 
     @route("/flows/{workflow_name}", method="GET", tags=["xflow"])
-    async def http_get_flow(self, workflow_name: str) -> dict:
-        d = await self._registry.get(workflow_name)
+    async def http_get_flow(self, tenant_id: str, workflow_name: str) -> dict:
+        d = await self._registry.get(tenant_id, workflow_name)
         if not d:
             return self._error("Workflow introuvable.", code="not_found")
         return self._ok(workflow=d.model_dump(mode="json"))
 
     @route("/flows/{workflow_name}", method="DELETE", tags=["xflow"])
-    async def http_delete_flow(self, workflow_name: str) -> dict:
-        return await self.ipc_unregister({"workflow_name": workflow_name})
+    async def http_delete_flow(self, tenant_id: str, workflow_name: str) -> dict:
+        return await self.ipc_unregister({"tenant_id": tenant_id, "workflow_name": workflow_name})
 
     @route("/run/{workflow_name}", method="POST", tags=["xflow"])
-    async def http_run(self, workflow_name: str, body: Dict[str, Any] = {}) -> dict:
-        return await self.ipc_trigger({"workflow_name": workflow_name, "payload": body})
+    async def http_run(self, tenant_id: str, workflow_name: str, body: Dict[str, Any] = {}) -> dict:
+        return await self.ipc_trigger({"tenant_id": tenant_id, "workflow_name": workflow_name, "payload": body})
 
     @route("/executions", method="GET", tags=["xflow"])
-    async def http_executions(self, workflow_name: Optional[str] = None, limit: int = 50) -> dict:
-        return await self.ipc_list_runs({"workflow_name": workflow_name, "limit": limit})
+    async def http_executions(self, tenant_id: str, workflow_name: Optional[str] = None, limit: int = 50) -> dict:
+        return await self.ipc_list_runs({"tenant_id": tenant_id, "workflow_name": workflow_name, "limit": limit})
 
     @route("/executions/{run_id}", method="GET", tags=["xflow"])
-    async def http_get_execution(self, run_id: str) -> dict:
-        return await self.ipc_get_run({"run_id": run_id})
+    async def http_get_execution(self, tenant_id: str, run_id: str) -> dict:
+        return await self.ipc_get_run({"tenant_id": tenant_id, "run_id": run_id})
 
     @route("/executions/{run_id}/cancel", method="POST", tags=["xflow"])
-    async def http_cancel(self, run_id: str) -> dict:
-        return await self.ipc_cancel_run({"run_id": run_id})
+    async def http_cancel(self, tenant_id: str, run_id: str) -> dict:
+        return await self.ipc_cancel_run({"tenant_id": tenant_id, "run_id": run_id})
 
     @route("/registry", method="GET", tags=["xflow"])
     async def http_registry(self) -> dict:
         return await self.ipc_registry({})
 
     @route("/webhook/{workflow_name}", method="POST", tags=["xflow"])
-    async def http_webhook(self, workflow_name: str, body: Dict[str, Any] = {}) -> dict:
-        """Endpoint webhook public — déclenche un workflow par nom."""
-        definition = await self._registry.get(workflow_name)
+    async def http_webhook(self, tenant_id: str, workflow_name: str, body: Dict[str, Any] = {}) -> dict:
+        definition = await self._registry.get(tenant_id, workflow_name)
         if not definition:
             return self._error(f"Workflow '{workflow_name}' introuvable.", code="not_found")
         if definition.trigger.type not in (TriggerType.WEBHOOK, TriggerType.MANUAL):
             return self._error("Ce workflow n'accepte pas les webhooks.", code="forbidden")
-        run = await self._engine.init_run(definition, trigger_payload=body, trigger_type="webhook")
+        run = await self._engine.init_run(
+            definition, tenant_id=tenant_id, trigger_payload=body, trigger_type="webhook"
+        )
         await self._enqueue_run_id(run.run_id)
         return self._ok(run_id=run.run_id, status=run.status.value)
 
     @route("/flows/{workflow_name}/graph", method="GET", tags=["xflow"])
-    async def http_flow_graph(self, workflow_name: str) -> dict:
-        d = await self._registry.get(workflow_name)
+    async def http_flow_graph(self, tenant_id: str, workflow_name: str) -> dict:
+        d = await self._registry.get(tenant_id, workflow_name)
         if not d:
             return self._error("Workflow introuvable.", code="not_found")
         return self._ok(graph=d.export_graph())
@@ -477,35 +507,31 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
     # ------------------------------------------------------------------
 
     @route("/composites", method="GET", tags=["composites"])
-    async def http_list_composites(self) -> dict:
-        """Liste tous les composites disponibles."""
-        return await self.ipc_composite_list({})
+    async def http_list_composites(self, tenant_id: str) -> dict:
+        return await self.ipc_composite_list({"tenant_id": tenant_id})
 
     @route("/composites", method="POST", tags=["composites"])
-    async def http_create_composite(self, body: Dict[str, Any]) -> dict:
-        """Crée un nouveau composite node."""
-        return await self.ipc_composite_register(body)
+    async def http_create_composite(self, tenant_id: str, body: Dict[str, Any]) -> dict:
+        return await self.ipc_composite_register({"tenant_id": tenant_id, **body})
 
     @route("/composites/{name}", method="GET", tags=["composites"])
-    async def http_get_composite(self, name: str) -> dict:
-        """Récupère un composite par son nom."""
-        composite = await self._composite_service.get(name)
+    async def http_get_composite(self, tenant_id: str, name: str) -> dict:
+        composite = await self._composite_service.get(tenant_id, name)
         if not composite:
             return self._error("Composite introuvable.", code="not_found")
         return self._ok(composite=composite.model_dump(mode="json"))
 
     @route("/composites/{name}", method="DELETE", tags=["composites"])
-    async def http_delete_composite(self, name: str) -> dict:
-        """Supprime un composite."""
-        success = await self._composite_service.delete(name)
+    async def http_delete_composite(self, tenant_id: str, name: str) -> dict:
+        success = await self._composite_service.delete(tenant_id, name)
         if not success:
             return self._error("Composite introuvable.", code="not_found")
         return self._ok(message=f"Composite '{name}' supprimé.")
 
     @route("/composites/{name}/expand", method="POST", tags=["composites"])
-    async def http_expand_composite(self, name: str, body: Dict[str, Any]) -> dict:
-        """Étend un composite en ses steps internes."""
+    async def http_expand_composite(self, tenant_id: str, name: str, body: Dict[str, Any]) -> dict:
         return await self.ipc_composite_expand({
+            "tenant_id": tenant_id,
             "composite_name": name,
             "instance_id": body.get("instance_id", "instance"),
             "inputs": body.get("inputs", {}),
@@ -517,12 +543,10 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
 
     @route("/events", method="GET", tags=["events"])
     async def http_list_events(self) -> dict:
-        """Liste tous les événements disponibles."""
         return await self.ipc_events_list({})
 
     @route("/events/refresh", method="POST", tags=["events"])
     async def http_refresh_events(self) -> dict:
-        """Rafraîchit le catalogue d'événements."""
         await self._event_catalog.refresh()
         return self._ok(message="Catalogue événements rafraîchi.")
 
@@ -540,12 +564,24 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
         if not event_name:
             return
 
-        definitions = await self._registry.list_event_handlers(event_name)
+        # Ignorer les events internes xflow pour éviter le traitement inutile
+        if event_name.startswith("workflow."):
+            return
+
+        event_data = (
+            getattr(event, "data", {})
+            if not isinstance(event, dict)
+            else event.get("data", {})
+        ) or {}
+
+        tenant_id = event_data.get("tenant_id")
+        if not tenant_id:
+            logger.debug("Événement '%s' ignoré — tenant_id manquant.", event_name)
+            return
+
+        definitions = await self._registry.list_event_handlers(tenant_id, event_name)
         for d in definitions:
-            trigger_data = (
-                getattr(event, "data", {})
-                if not isinstance(event, dict)
-                else event.get("data", {})
+            run = await self._engine.init_run(
+                d, tenant_id=tenant_id, trigger_payload=event_data, trigger_type="event"
             )
-            run = await self._engine.init_run(d, trigger_payload=trigger_data, trigger_type="event")
             await self._enqueue_run_id(run.run_id)

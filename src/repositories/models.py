@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from sqlalchemy import DateTime, String, Text, JSON, Boolean, ForeignKey, Integer
+from sqlalchemy import Column, DateTime, String, Text, JSON, Boolean, ForeignKey, Integer, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -17,9 +17,11 @@ class Base(DeclarativeBase):
 
 class FlowRecord(Base):
     __tablename__ = "xflow_flows"
+    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_xflow_flows_tenant_name"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    name: Mapped[str] = mapped_column(String(255), index=True)
     description: Mapped[Optional[str]] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
@@ -45,6 +47,7 @@ class FlowRunRecord(Base):
     __tablename__ = "xflow_runs"
 
     run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
     version_id: Mapped[Optional[int]] = mapped_column(ForeignKey("xflow_versions.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
     trigger_type: Mapped[str] = mapped_column(String(32))
@@ -107,3 +110,20 @@ class FlowAuditLogRecord(Base):
     message: Mapped[str] = mapped_column(Text)
     extra_data: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class CompositeRecord(Base):
+    __tablename__ = "xflow_composites"
+    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_xflow_composites_tenant_name"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(64), nullable=False, index=True)
+    name = Column(String(255), nullable=False, index=True)
+    version = Column(String(64), default="1.0.0")
+    description = Column(Text)
+    icon = Column(String(64))
+    category = Column(String(64), default="custom")
+    definition = Column(JSON, nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True))
+    updated_at = Column(DateTime(timezone=True))

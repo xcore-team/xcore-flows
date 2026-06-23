@@ -1,5 +1,6 @@
 from .models import (
     Base,
+    CompositeRecord,
     FlowRecord,
     FlowVersionRecord,
     FlowRunRecord,
@@ -12,6 +13,7 @@ from .workflow import WorkflowStore
 
 __all__ = [
     "Base",
+    "CompositeRecord",
     "FlowRecord",
     "FlowVersionRecord",
     "FlowRunRecord",

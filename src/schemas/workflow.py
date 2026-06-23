@@ -333,6 +333,7 @@ class StepRun(BaseModel):
 
 class WorkflowRun(BaseModel):
     run_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    tenant_id: str = "default"
     workflow_name: str
     workflow_version: str = "1.0.0"
     status: WorkflowStatus = WorkflowStatus.PENDING
