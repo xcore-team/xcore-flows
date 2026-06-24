@@ -8,9 +8,9 @@ execution_mode: trusted
 framework_version: ">=2.0"
 entry_point: src/main.py
 
-#requires:
-#  - name: auth
-#    version: 0.1.0
+requires:
+  - name: auth
+    version: 1.0.0
 
 permissions:
   - resource: "xflow.integration"
@@ -49,6 +49,43 @@ permissions:
   - resource: "plugins.*"
     actions: ["call"]
     effect: allow
+
+rbac:
+  grants:
+    - name: xflow:workflows:read
+      description: "Consulter la liste et le détail des workflows"
+      tenant_grantable: true
+      group: xflow
+
+    - name: xflow:workflows:write
+      description: "Déployer et supprimer des workflows"
+      tenant_grantable: true
+      group: xflow
+
+    - name: xflow:runs:read
+      description: "Consulter les exécutions et leur état"
+      tenant_grantable: true
+      group: xflow
+
+    - name: xflow:runs:write
+      description: "Déclencher, annuler et relancer des runs"
+      tenant_grantable: true
+      group: xflow
+
+    - name: xflow:composites:read
+      description: "Consulter les nœuds composites"
+      tenant_grantable: true
+      group: xflow
+
+    - name: xflow:composites:write
+      description: "Créer et supprimer des nœuds composites"
+      tenant_grantable: true
+      group: xflow
+
+    - name: xflow:admin
+      description: "Accès complet xflow — génération IA, webhooks, refresh catalogue"
+      tenant_grantable: false
+      group: xflow
 
 resources:
   timeout_seconds: 300

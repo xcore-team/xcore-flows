@@ -31,7 +31,8 @@ class DiscoveryService:
     def __init__(self, schema_path: Path = _DEFAULT_SCHEMA_PATH) -> None:
         self._schema_path = schema_path
         self._actions: Dict[str, Dict[str, Any]] = {}   # "plugin:action" -> schema dict
-        self._listeners_index: Dict[str, List[str]] = {}  # event -> [plugin, ...]
+        self._listeners_index: Dict[str, List[str]] = {}  # event -> [plugin subscribers]
+        self._emitted_events: Dict[str, Dict[str, Any]] = {}  # event_name -> {description, payload_schema, source_plugin}
         self._raw: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
@@ -67,16 +68,26 @@ class DiscoveryService:
                 if event_name:
                     listeners.setdefault(event_name, []).append(plugin_name)
 
+        emitted: Dict[str, Dict[str, Any]] = {}
+        for plugin_name, data in raw.items():
+            for event_name, meta in (data.get("events_emitted") or {}).items():
+                emitted[event_name] = {
+                    "name": event_name,
+                    "description": meta.get("description", ""),
+                    "payload_schema": meta.get("payload_schema", {}),
+                    "source_plugin": plugin_name,
+                }
+
         self._actions = actions
         self._listeners_index = listeners
+        self._emitted_events = emitted
 
-        action_count = len(actions)
-        event_count = len(listeners)
         logger.info(
-            "Catalogue chargé depuis %s — %d action(s), %d événement(s).",
+            "Catalogue chargé depuis %s — %d action(s), %d subscription(s), %d événement(s) émis.",
             self._schema_path,
-            action_count,
-            event_count,
+            len(actions),
+            len(listeners),
+            len(emitted),
         )
 
     # ------------------------------------------------------------------
@@ -127,3 +138,19 @@ class DiscoveryService:
             for evt, plugins in self._listeners_index.items()
             if plugin_name in plugins
         ]
+
+    # ------------------------------------------------------------------
+    # Événements émis (déclarés dans events_emitted de plugin.yaml)
+    # ------------------------------------------------------------------
+
+    def list_emitted_events(self) -> List[Dict[str, Any]]:
+        """Retourne tous les événements émis avec leur schéma de payload."""
+        return list(self._emitted_events.values())
+
+    def get_emitted_event(self, event_name: str) -> Optional[Dict[str, Any]]:
+        """Retourne le schéma d'un événement émis par son nom."""
+        return self._emitted_events.get(event_name)
+
+    def list_emitted_by_plugin(self, plugin_name: str) -> List[Dict[str, Any]]:
+        """Retourne les événements émis par un plugin donné."""
+        return [e for e in self._emitted_events.values() if e.get("source_plugin") == plugin_name]

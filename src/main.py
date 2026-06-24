@@ -39,7 +39,9 @@ logger = logging.getLogger("xflow")
 
 XFLOW_QUEUE = "xflow:queue:tasks"
 
+from fastapi import Depends
 from xcore.sdk import AutoDispatchMixin, RoutedPlugin, TrustedBase, action, route, schema, get_logger
+from xcore.kernel.api.rbac import get_current_user, require_permission
 
 logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
@@ -103,8 +105,8 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
         self._ai_gen = AIWorkflowGenerator(self, self._discovery)
 
         self._composite_service = CompositeService(self.db)
-        self._event_catalog = EventCatalogService(self.ctx)
-        asyncio.create_task(self._event_catalog.discover_events())
+        self._event_catalog = EventCatalogService(self._discovery, ctx=self.ctx)
+        await self._declare_rbac()
 
         self.ctx.events.on("*", self._on_any_event)
 
@@ -444,38 +446,38 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
     # ------------------------------------------------------------------
 
     @route("/flows", method="GET", tags=["xflow"])
-    async def http_list_flows(self, tenant_id: str) -> dict:
+    async def http_list_flows(self, tenant_id: str, _=Depends(require_permission("xflow:workflows:read"))) -> dict:
         return await self.ipc_list_workflows({"tenant_id": tenant_id})
 
     @route("/flows", method="POST", tags=["xflow"])
-    async def http_deploy(self, tenant_id: str, body: Dict[str, Any]) -> dict:
+    async def http_deploy(self, tenant_id: str, body: Dict[str, Any], _=Depends(require_permission("xflow:workflows:write"))) -> dict:
         return await self.ipc_register({"tenant_id": tenant_id, "definition": body})
 
     @route("/flows/{workflow_name}", method="GET", tags=["xflow"])
-    async def http_get_flow(self, tenant_id: str, workflow_name: str) -> dict:
+    async def http_get_flow(self, tenant_id: str, workflow_name: str, _=Depends(require_permission("xflow:workflows:read"))) -> dict:
         d = await self._registry.get(tenant_id, workflow_name)
         if not d:
             return self._error("Workflow introuvable.", code="not_found")
         return self._ok(workflow=d.model_dump(mode="json"))
 
     @route("/flows/{workflow_name}", method="DELETE", tags=["xflow"])
-    async def http_delete_flow(self, tenant_id: str, workflow_name: str) -> dict:
+    async def http_delete_flow(self, tenant_id: str, workflow_name: str, _=Depends(require_permission("xflow:workflows:write"))) -> dict:
         return await self.ipc_unregister({"tenant_id": tenant_id, "workflow_name": workflow_name})
 
     @route("/run/{workflow_name}", method="POST", tags=["xflow"])
-    async def http_run(self, tenant_id: str, workflow_name: str, body: Dict[str, Any] = {}) -> dict:
+    async def http_run(self, tenant_id: str, workflow_name: str, body: Dict[str, Any] = {}, _=Depends(require_permission("xflow:runs:write"))) -> dict:
         return await self.ipc_trigger({"tenant_id": tenant_id, "workflow_name": workflow_name, "payload": body})
 
     @route("/executions", method="GET", tags=["xflow"])
-    async def http_executions(self, tenant_id: str, workflow_name: Optional[str] = None, limit: int = 50) -> dict:
+    async def http_executions(self, tenant_id: str, workflow_name: Optional[str] = None, limit: int = 50, _=Depends(require_permission("xflow:runs:read"))) -> dict:
         return await self.ipc_list_runs({"tenant_id": tenant_id, "workflow_name": workflow_name, "limit": limit})
 
     @route("/executions/{run_id}", method="GET", tags=["xflow"])
-    async def http_get_execution(self, tenant_id: str, run_id: str) -> dict:
+    async def http_get_execution(self, tenant_id: str, run_id: str, _=Depends(require_permission("xflow:runs:read"))) -> dict:
         return await self.ipc_get_run({"tenant_id": tenant_id, "run_id": run_id})
 
     @route("/executions/{run_id}/cancel", method="POST", tags=["xflow"])
-    async def http_cancel(self, tenant_id: str, run_id: str) -> dict:
+    async def http_cancel(self, tenant_id: str, run_id: str, _=Depends(require_permission("xflow:runs:write"))) -> dict:
         return await self.ipc_cancel_run({"tenant_id": tenant_id, "run_id": run_id})
 
     @route("/registry", method="GET", tags=["xflow"])
@@ -496,7 +498,7 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
         return self._ok(run_id=run.run_id, status=run.status.value)
 
     @route("/flows/{workflow_name}/graph", method="GET", tags=["xflow"])
-    async def http_flow_graph(self, tenant_id: str, workflow_name: str) -> dict:
+    async def http_flow_graph(self, tenant_id: str, workflow_name: str, _=Depends(require_permission("xflow:workflows:read"))) -> dict:
         d = await self._registry.get(tenant_id, workflow_name)
         if not d:
             return self._error("Workflow introuvable.", code="not_found")
@@ -507,29 +509,29 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
     # ------------------------------------------------------------------
 
     @route("/composites", method="GET", tags=["composites"])
-    async def http_list_composites(self, tenant_id: str) -> dict:
+    async def http_list_composites(self, tenant_id: str, _=Depends(require_permission("xflow:composites:read"))) -> dict:
         return await self.ipc_composite_list({"tenant_id": tenant_id})
 
     @route("/composites", method="POST", tags=["composites"])
-    async def http_create_composite(self, tenant_id: str, body: Dict[str, Any]) -> dict:
+    async def http_create_composite(self, tenant_id: str, body: Dict[str, Any], _=Depends(require_permission("xflow:composites:write"))) -> dict:
         return await self.ipc_composite_register({"tenant_id": tenant_id, **body})
 
     @route("/composites/{name}", method="GET", tags=["composites"])
-    async def http_get_composite(self, tenant_id: str, name: str) -> dict:
+    async def http_get_composite(self, tenant_id: str, name: str, _=Depends(require_permission("xflow:composites:read"))) -> dict:
         composite = await self._composite_service.get(tenant_id, name)
         if not composite:
             return self._error("Composite introuvable.", code="not_found")
         return self._ok(composite=composite.model_dump(mode="json"))
 
     @route("/composites/{name}", method="DELETE", tags=["composites"])
-    async def http_delete_composite(self, tenant_id: str, name: str) -> dict:
+    async def http_delete_composite(self, tenant_id: str, name: str, _=Depends(require_permission("xflow:composites:write"))) -> dict:
         success = await self._composite_service.delete(tenant_id, name)
         if not success:
             return self._error("Composite introuvable.", code="not_found")
         return self._ok(message=f"Composite '{name}' supprimé.")
 
     @route("/composites/{name}/expand", method="POST", tags=["composites"])
-    async def http_expand_composite(self, tenant_id: str, name: str, body: Dict[str, Any]) -> dict:
+    async def http_expand_composite(self, tenant_id: str, name: str, body: Dict[str, Any], _=Depends(require_permission("xflow:composites:read"))) -> dict:
         return await self.ipc_composite_expand({
             "tenant_id": tenant_id,
             "composite_name": name,
@@ -542,13 +544,28 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
     # ------------------------------------------------------------------
 
     @route("/events", method="GET", tags=["events"])
-    async def http_list_events(self) -> dict:
+    async def http_list_events(self, _=Depends(require_permission("xflow:workflows:read"))) -> dict:
         return await self.ipc_events_list({})
 
     @route("/events/refresh", method="POST", tags=["events"])
-    async def http_refresh_events(self) -> dict:
+    async def http_refresh_events(self, _=Depends(require_permission("xflow:admin"))) -> dict:
         await self._event_catalog.refresh()
         return self._ok(message="Catalogue événements rafraîchi.")
+
+    async def _declare_rbac(self) -> None:
+        rbac = (self.ctx.config or {}).get("rbac") or {}
+        grants = rbac.get("grants") or []
+        if not grants:
+            return
+        try:
+            await self.ctx.events.emit(
+                "rbac.declare",
+                {"plugin": "xflow", "grants": grants},
+                source="xflow",
+            )
+            logger.info("[xflow] rbac.declare émis (%d grant(s))", len(grants))
+        except Exception as exc:
+            logger.warning("[xflow] rbac.declare ignoré : %s", exc)
 
     def get_router(self) -> Any | None:
         return self.RouterIn()
