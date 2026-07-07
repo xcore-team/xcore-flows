@@ -41,7 +41,7 @@ XFLOW_QUEUE = "xflow:queue:tasks"
 
 from fastapi import Depends
 from xcore.sdk import AutoDispatchMixin, RoutedPlugin, TrustedBase, action, route, schema, get_logger
-from xcore.kernel.api.rbac import get_current_user, require_permission
+from xcore.kernel.api.rbac import get_current_user, require_permission, AuthPayload
 
 logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
@@ -83,6 +83,16 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
 
         await self._create_tables()
 
+        # Service WebSocket temps réel (optionnel — absent en tests/déploiements sans WS).
+        # Même convention que xcompany/tasks : canal "xflow" déclaré dans integration.yaml.
+        self._ws = (
+            self.get_service("ext.websocket")
+            if self.ctx.has_service("ext.websocket")
+            else None
+        )
+        if self._ws is None:
+            logger.info("Service WebSocket absent — diffusion temps réel désactivée.")
+
         from .repositories import WorkflowStore
         self._store = WorkflowStore(self.db, self._queue_client if self._has_redis else None)
         self._engine = WorkflowEngine(self)
@@ -108,7 +118,12 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
         self._event_catalog = EventCatalogService(self._discovery, ctx=self.ctx)
         await self._declare_rbac()
 
-        self.ctx.events.on("*", self._on_any_event)
+        @self.ctx.events.on("*",)
+        async def _(event):
+            # Découplé de la requête émettrice : le déclenchement (écriture DB du run)
+            # ne doit pas s'exécuter dans la transaction de l'appelant (ex. login),
+            # sous peine de contention de verrou ("database is locked" en SQLite).
+            asyncio.create_task(self._on_any_event(event=event))
 
         await self._resume_crashed_runs()
 
@@ -446,46 +461,47 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
     # ------------------------------------------------------------------
 
     @route("/flows", method="GET", tags=["xflow"])
-    async def http_list_flows(self, tenant_id: str, _=Depends(require_permission("xflow:workflows:read"))) -> dict:
-        return await self.ipc_list_workflows({"tenant_id": tenant_id})
+    async def http_list_flows(self, users:AuthPayload=Depends(require_permission("xflow:workflows:read"))) -> dict:
+        return await self.ipc_list_workflows({"tenant_id": users['user']['tenant_id']})
 
     @route("/flows", method="POST", tags=["xflow"])
-    async def http_deploy(self, tenant_id: str, body: Dict[str, Any], _=Depends(require_permission("xflow:workflows:write"))) -> dict:
-        return await self.ipc_register({"tenant_id": tenant_id, "definition": body})
+    async def http_deploy(self,body: Dict[str, Any], users:AuthPayload=Depends(require_permission("xflow:workflows:write"))) -> dict:
+        return await self.ipc_register({"tenant_id": users['user']['tenant_id'], "definition": body})
 
     @route("/flows/{workflow_name}", method="GET", tags=["xflow"])
-    async def http_get_flow(self, tenant_id: str, workflow_name: str, _=Depends(require_permission("xflow:workflows:read"))) -> dict:
-        d = await self._registry.get(tenant_id, workflow_name)
+    async def http_get_flow(self,workflow_name: str, users:AuthPayload=Depends(require_permission("xflow:workflows:read"))) -> dict:
+        d = await self._registry.get( users['user']['tenant_id'], workflow_name)
         if not d:
             return self._error("Workflow introuvable.", code="not_found")
         return self._ok(workflow=d.model_dump(mode="json"))
 
     @route("/flows/{workflow_name}", method="DELETE", tags=["xflow"])
-    async def http_delete_flow(self, tenant_id: str, workflow_name: str, _=Depends(require_permission("xflow:workflows:write"))) -> dict:
-        return await self.ipc_unregister({"tenant_id": tenant_id, "workflow_name": workflow_name})
+    async def http_delete_flow(self, workflow_name: str, users:AuthPayload=Depends(require_permission("xflow:workflows:write"))) -> dict:
+        return await self.ipc_unregister({"tenant_id": users['user']['tenant_id'], "workflow_name": workflow_name})
 
     @route("/run/{workflow_name}", method="POST", tags=["xflow"])
-    async def http_run(self, tenant_id: str, workflow_name: str, body: Dict[str, Any] = {}, _=Depends(require_permission("xflow:runs:write"))) -> dict:
-        return await self.ipc_trigger({"tenant_id": tenant_id, "workflow_name": workflow_name, "payload": body})
+    async def http_run(self, workflow_name: str, body: Dict[str, Any] = {}, users:AuthPayload=Depends(require_permission("xflow:runs:write"))) -> dict:
+        return await self.ipc_trigger({"tenant_id": users['user']['tenant_id'], "workflow_name": workflow_name, "payload": body})
 
     @route("/executions", method="GET", tags=["xflow"])
-    async def http_executions(self, tenant_id: str, workflow_name: Optional[str] = None, limit: int = 50, _=Depends(require_permission("xflow:runs:read"))) -> dict:
-        return await self.ipc_list_runs({"tenant_id": tenant_id, "workflow_name": workflow_name, "limit": limit})
+    async def http_executions(self, workflow_name: Optional[str] = None, limit: int = 50, users:AuthPayload=Depends(require_permission("xflow:runs:read"))) -> dict:
+        return await self.ipc_list_runs({"tenant_id": users['user']['tenant_id'], "workflow_name": workflow_name, "limit": limit})
 
     @route("/executions/{run_id}", method="GET", tags=["xflow"])
-    async def http_get_execution(self, tenant_id: str, run_id: str, _=Depends(require_permission("xflow:runs:read"))) -> dict:
-        return await self.ipc_get_run({"tenant_id": tenant_id, "run_id": run_id})
+    async def http_get_execution(self, run_id: str, users:AuthPayload=Depends(require_permission("xflow:runs:read"))) -> dict:
+        return await self.ipc_get_run({"tenant_id": users['user']['tenant_id'], "run_id": run_id})
 
     @route("/executions/{run_id}/cancel", method="POST", tags=["xflow"])
-    async def http_cancel(self, tenant_id: str, run_id: str, _=Depends(require_permission("xflow:runs:write"))) -> dict:
-        return await self.ipc_cancel_run({"tenant_id": tenant_id, "run_id": run_id})
+    async def http_cancel(self, run_id: str, users:AuthPayload=Depends(require_permission("xflow:runs:write"))) -> dict:
+        return await self.ipc_cancel_run({"tenant_id": users['user']['tenant_id'], "run_id": run_id})
 
     @route("/registry", method="GET", tags=["xflow"])
     async def http_registry(self) -> dict:
         return await self.ipc_registry({})
 
     @route("/webhook/{workflow_name}", method="POST", tags=["xflow"])
-    async def http_webhook(self, tenant_id: str, workflow_name: str, body: Dict[str, Any] = {}) -> dict:
+    async def http_webhook(self, workflow_name: str, tenant_id: str, body: Dict[str, Any] = {}) -> dict:
+        # Webhook appelé par un système externe (pas de JWT) : le tenant vient de l'URL.
         definition = await self._registry.get(tenant_id, workflow_name)
         if not definition:
             return self._error(f"Workflow '{workflow_name}' introuvable.", code="not_found")
@@ -498,8 +514,8 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
         return self._ok(run_id=run.run_id, status=run.status.value)
 
     @route("/flows/{workflow_name}/graph", method="GET", tags=["xflow"])
-    async def http_flow_graph(self, tenant_id: str, workflow_name: str, _=Depends(require_permission("xflow:workflows:read"))) -> dict:
-        d = await self._registry.get(tenant_id, workflow_name)
+    async def http_flow_graph(self, workflow_name: str, users:AuthPayload=Depends(require_permission("xflow:workflows:read"))) -> dict:
+        d = await self._registry.get(users['user']['tenant_id'], workflow_name)
         if not d:
             return self._error("Workflow introuvable.", code="not_found")
         return self._ok(graph=d.export_graph())
@@ -509,31 +525,31 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
     # ------------------------------------------------------------------
 
     @route("/composites", method="GET", tags=["composites"])
-    async def http_list_composites(self, tenant_id: str, _=Depends(require_permission("xflow:composites:read"))) -> dict:
-        return await self.ipc_composite_list({"tenant_id": tenant_id})
+    async def http_list_composites(self, users:AuthPayload=Depends(require_permission("xflow:composites:read"))) -> dict:
+        return await self.ipc_composite_list({"tenant_id": users['user']['tenant_id']})
 
     @route("/composites", method="POST", tags=["composites"])
-    async def http_create_composite(self, tenant_id: str, body: Dict[str, Any], _=Depends(require_permission("xflow:composites:write"))) -> dict:
-        return await self.ipc_composite_register({"tenant_id": tenant_id, **body})
+    async def http_create_composite(self, body: Dict[str, Any], users:AuthPayload=Depends(require_permission("xflow:composites:write"))) -> dict:
+        return await self.ipc_composite_register({"tenant_id": users['user']['tenant_id'], **body})
 
     @route("/composites/{name}", method="GET", tags=["composites"])
-    async def http_get_composite(self, tenant_id: str, name: str, _=Depends(require_permission("xflow:composites:read"))) -> dict:
-        composite = await self._composite_service.get(tenant_id, name)
+    async def http_get_composite(self, name: str, users:AuthPayload=Depends(require_permission("xflow:composites:read"))) -> dict:
+        composite = await self._composite_service.get(users['user']['tenant_id'], name)
         if not composite:
             return self._error("Composite introuvable.", code="not_found")
         return self._ok(composite=composite.model_dump(mode="json"))
 
     @route("/composites/{name}", method="DELETE", tags=["composites"])
-    async def http_delete_composite(self, tenant_id: str, name: str, _=Depends(require_permission("xflow:composites:write"))) -> dict:
-        success = await self._composite_service.delete(tenant_id, name)
+    async def http_delete_composite(self, name: str, users:AuthPayload=Depends(require_permission("xflow:composites:write"))) -> dict:
+        success = await self._composite_service.delete(users['user']['tenant_id'], name)
         if not success:
             return self._error("Composite introuvable.", code="not_found")
         return self._ok(message=f"Composite '{name}' supprimé.")
 
     @route("/composites/{name}/expand", method="POST", tags=["composites"])
-    async def http_expand_composite(self, tenant_id: str, name: str, body: Dict[str, Any], _=Depends(require_permission("xflow:composites:read"))) -> dict:
+    async def http_expand_composite(self, name: str, body: Dict[str, Any], users:AuthPayload=Depends(require_permission("xflow:composites:read"))) -> dict:
         return await self.ipc_composite_expand({
-            "tenant_id": tenant_id,
+            "tenant_id": users['user']['tenant_id'],
             "composite_name": name,
             "instance_id": body.get("instance_id", "instance"),
             "inputs": body.get("inputs", {}),
@@ -544,11 +560,11 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
     # ------------------------------------------------------------------
 
     @route("/events", method="GET", tags=["events"])
-    async def http_list_events(self, _=Depends(require_permission("xflow:workflows:read"))) -> dict:
+    async def http_list_events(self, users:AuthPayload=Depends(require_permission("xflow:workflows:read"))) -> dict:
         return await self.ipc_events_list({})
 
     @route("/events/refresh", method="POST", tags=["events"])
-    async def http_refresh_events(self, _=Depends(require_permission("xflow:admin"))) -> dict:
+    async def http_refresh_events(self, users:AuthPayload=Depends(require_permission("xflow:admin"))) -> dict:
         await self._event_catalog.refresh()
         return self._ok(message="Catalogue événements rafraîchi.")
 
@@ -592,13 +608,26 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
         ) or {}
 
         tenant_id = event_data.get("tenant_id")
-        if not tenant_id:
-            logger.debug("Événement '%s' ignoré — tenant_id manquant.", event_name)
-            return
 
-        definitions = await self._registry.list_event_handlers(tenant_id, event_name)
-        for d in definitions:
+        if tenant_id:
+            # Event tenant-scopé : on ne déclenche que les workflows de ce tenant.
+            handlers = [
+                (tenant_id, d)
+                for d in await self._registry.list_event_handlers(tenant_id, event_name)
+            ]
+        else:
+            # La plupart des events métier ne portent pas de tenant_id : on cherche
+            # alors les handlers de TOUS les tenants et on déclenche chacun dans le sien.
+            handlers = await self._registry.list_event_handlers_all_tenants(event_name)
+
+        for handler_tenant, d in handlers:
+            # Injecte le tenant résolu dans le payload pour que les steps y aient accès.
+            payload = {**event_data, "tenant_id": handler_tenant}
             run = await self._engine.init_run(
-                d, tenant_id=tenant_id, trigger_payload=event_data, trigger_type="event"
+                d, tenant_id=handler_tenant, trigger_payload=payload, trigger_type="event"
             )
             await self._enqueue_run_id(run.run_id)
+            logger.info(
+                "Workflow '%s' déclenché par l'événement '%s' (tenant=%s, run=%s).",
+                d.name, event_name, handler_tenant, run.run_id,
+            )

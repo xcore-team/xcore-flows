@@ -37,10 +37,7 @@ async def execute_with_retry(
         retry_cfg:    Configuration retry. Si None, exécution unique sans retry.
         on_retry:     Callback optionnel appelé avant chaque retry (attempt, delay, error).
     """
-    if retry_cfg is None:
-        return await coro_factory()
-
-    max_attempts = retry_cfg.max_attempts
+    max_attempts = retry_cfg.max_attempts if retry_cfg is not None else 1
     last_error = ""
 
     for attempt in range(1, max_attempts + 1):
@@ -48,12 +45,16 @@ async def execute_with_retry(
             result = await coro_factory()
 
             # Traitement des erreurs "soft" (réponse IPC avec status="error")
+            # Vérifié systématiquement, même sans config de retry.
             if isinstance(result, dict) and result.get("status") == "error":
                 code = result.get("code", "")
-                if retry_cfg.retry_on_codes and code not in retry_cfg.retry_on_codes:
-                    # Code non retryable → retourner l'erreur directement
-                    return result
                 last_error = result.get("message", str(result))
+                if (
+                    retry_cfg is None
+                    or (retry_cfg.retry_on_codes and code not in retry_cfg.retry_on_codes)
+                ):
+                    # Pas de retry configuré, ou code non retryable → échec direct.
+                    raise RetryExhausted(last_error, attempt) from None
                 raise _SoftError(last_error)
 
             return result
@@ -61,6 +62,8 @@ async def execute_with_retry(
         except _SoftError as exc:
             last_error = str(exc)
         except asyncio.CancelledError:
+            raise
+        except RetryExhausted:
             raise
         except Exception as exc:
             last_error = str(exc)

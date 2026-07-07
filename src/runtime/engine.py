@@ -229,6 +229,7 @@ class WorkflowEngine:
         step_run.status = StepStatus.RUNNING
         step_run.started_at = datetime.now(timezone.utc)
         await self._save_run(run)
+        await self._emit("workflow.step.running", run, {"step_id": step.id, "status": "running"})
 
         context = self._build_context(run)
         payload = render_payload(step.payload, context)
@@ -244,15 +245,18 @@ class WorkflowEngine:
             result = await execute_with_retry(call_action, step.retry)
             step_run.status = StepStatus.SUCCESS
 
-            step_run.result = result.get("result") if isinstance(result, dict) else result
+            if isinstance(result, dict):
+                step_run.result = {k: v for k, v in result.items() if k != "status"}
+            else:
+                step_run.result = result
             run.context.setdefault("steps", {})[step.id] = {"result": step_run.result}
-            await self._emit("workflow.step.success", run, {"step_id": step.id})
+            await self._emit("workflow.step.success", run, {"step_id": step.id, "status": "success"})
             return step.on_success or END
 
         except (RetryExhausted, Exception) as e:
             step_run.status = StepStatus.FAILED
             step_run.error = str(e)
-            await self._emit("workflow.step.failed", run, {"step_id": step.id, "error": str(e)})
+            await self._emit("workflow.step.failed", run, {"step_id": step.id, "status": "failed", "error": str(e)})
             if step.on_failure:
                 return step.on_failure
             raise
@@ -387,3 +391,12 @@ class WorkflowEngine:
             await self.ctx.events.emit(event_name, data)
         except Exception:
             pass  # L'EventBus ne doit jamais faire planter un run
+
+        # Diffusion temps réel vers les clients connectés (canal "xflow").
+        # Fire-and-forget : une erreur WS ne doit jamais faire planter un run.
+        ws = getattr(self.plugin, "_ws", None)
+        if ws is not None:
+            try:
+                await ws.broadcast(channel="xflow", event=event_name, data=data)
+            except Exception:
+                pass

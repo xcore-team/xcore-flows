@@ -12,15 +12,27 @@ _TEMPLATE_RE = re.compile(r"\{\{\s*([\w.]+)\s*\}\}")
 
 
 def _resolve_path(path: str, data: Dict[str, Any]) -> Any:
-    parts = path.split(".")
     current: Any = data
-    for part in parts:
+    rest = path
+    while rest:
         if isinstance(current, dict):
-            current = current.get(part)
-        elif hasattr(current, part):
-            current = getattr(current, part)
+            # Les clés peuvent contenir des points (ex. id de step "auth_xauth.get_user_rk2f").
+            # On matche la clé la plus longue qui préfixe le chemin restant sur une frontière de point.
+            matched: str | None = None
+            for key in current:
+                if rest == key or rest.startswith(key + "."):
+                    if matched is None or len(key) > len(matched):
+                        matched = key
+            if matched is None:
+                return None
+            current = current[matched]
+            rest = rest[len(matched):].lstrip(".")
         else:
-            return None
+            part, _, rest = rest.partition(".")
+            if hasattr(current, part):
+                current = getattr(current, part)
+            else:
+                return None
     return current
 
 

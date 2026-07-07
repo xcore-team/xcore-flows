@@ -8,7 +8,13 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class _StepBase(BaseModel):
+    """Base des steps : autorise les métadonnées d'éditeur (_x, _y) à être
+    conservées au round-trip sans les déclarer explicitement."""
+    model_config = ConfigDict(extra="allow")
 
 
 class StepType(str, Enum):
@@ -100,7 +106,7 @@ class ConditionConfig(BaseModel):
     )
 
 
-class TriggerConfig(BaseModel):
+class TriggerConfig(_StepBase):
     type: TriggerType = TriggerType.MANUAL
     event_name: Optional[str] = None
     webhook_path: Optional[str] = None
@@ -121,7 +127,7 @@ class WebhookNotification(BaseModel):
     timeout_seconds: float = 10.0
 
 
-class ActionStep(BaseModel):
+class ActionStep(_StepBase):
     id: str
     type: Literal[StepType.ACTION] = StepType.ACTION
     plugin: str = Field(description="Nom du plugin cible")
@@ -134,7 +140,7 @@ class ActionStep(BaseModel):
     description: Optional[str] = None
 
 
-class ConditionStep(BaseModel):
+class ConditionStep(_StepBase):
     id: str
     type: Literal[StepType.CONDITION] = StepType.CONDITION
     condition: ConditionConfig
@@ -143,7 +149,7 @@ class ConditionStep(BaseModel):
     description: Optional[str] = None
 
 
-class ParallelStep(BaseModel):
+class ParallelStep(_StepBase):
     id: str
     type: Literal[StepType.PARALLEL] = StepType.PARALLEL
     branches: List[List[str]] = Field(
@@ -155,7 +161,7 @@ class ParallelStep(BaseModel):
     description: Optional[str] = None
 
 
-class WaitStep(BaseModel):
+class WaitStep(_StepBase):
     id: str
     type: Literal[StepType.WAIT] = StepType.WAIT
     delay_seconds: Optional[float] = None
@@ -166,7 +172,7 @@ class WaitStep(BaseModel):
     description: Optional[str] = None
 
 
-class SwitchStep(BaseModel):
+class SwitchStep(_StepBase):
     id: str
     type: Literal[StepType.SWITCH] = StepType.SWITCH
     expression: str = Field(description="Expression à évaluer")
@@ -175,7 +181,7 @@ class SwitchStep(BaseModel):
     description: Optional[str] = None
 
 
-class ForeachStep(BaseModel):
+class ForeachStep(_StepBase):
     id: str
     type: Literal[StepType.FOREACH] = StepType.FOREACH
     items: str = Field(description="Expression pointant vers la liste à itérer")
@@ -188,7 +194,7 @@ class ForeachStep(BaseModel):
     description: Optional[str] = None
 
 
-class TransformStep(BaseModel):
+class TransformStep(_StepBase):
     id: str
     type: Literal[StepType.TRANSFORM] = StepType.TRANSFORM
     query: str = Field(description="Requête JQ ou expression de transformation")
@@ -197,7 +203,7 @@ class TransformStep(BaseModel):
     description: Optional[str] = None
 
 
-class TemplateStep(BaseModel):
+class TemplateStep(_StepBase):
     id: str
     type: Literal[StepType.TEMPLATE] = StepType.TEMPLATE
     template: str = Field(description="Template Jinja2")
@@ -213,7 +219,7 @@ class AIService(str, Enum):
     EXTRACT   = "extract"
 
 
-class AIStep(BaseModel):
+class AIStep(_StepBase):
     id: str
     type: Literal[StepType.AI] = StepType.AI
     service: AIService

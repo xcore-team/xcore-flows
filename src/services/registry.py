@@ -61,6 +61,10 @@ class WorkflowRegistryService:
     async def list_event_handlers(self, tenant_id: str, event_name: str) -> List[WorkflowDefinition]:
         return await self._store.list_event_definitions(tenant_id, event_name)
 
+    async def list_event_handlers_all_tenants(self, event_name: str):
+        """(tenant_id, définition) pour tous les tenants — pour les events sans tenant_id."""
+        return await self._store.list_event_definitions_all_tenants(event_name)
+
     async def sync_scheduler(self) -> None:
         """Réenregistre les workflows SCHEDULE au démarrage — sans isolation tenant (global scan)."""
         if self._scheduler is None:

@@ -179,6 +179,40 @@ class WorkflowStore:
             and d.trigger.event_name == event_name
         ]
 
+    async def list_event_definitions_all_tenants(
+        self, event_name: str
+    ) -> List[tuple[str, WorkflowDefinition]]:
+        """Retourne (tenant_id, définition) pour tous les workflows, tous tenants
+        confondus, déclenchés par l'événement `event_name`.
+
+        Nécessaire car la plupart des events métier ne transportent pas de
+        `tenant_id` : on ne peut donc pas se limiter à un tenant précis.
+        """
+        async with self._db.session() as session:
+            stmt = (
+                select(FlowVersionRecord)
+                .options(selectinload(FlowVersionRecord.flow))
+                .join(FlowRecord)
+                .order_by(desc(FlowVersionRecord.created_at))
+            )
+            result = await session.execute(stmt)
+            records = result.scalars().all()
+
+        seen: set[tuple[str, str]] = set()
+        out: List[tuple[str, WorkflowDefinition]] = []
+        for r in records:
+            key = (r.flow.tenant_id, r.flow.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            definition = WorkflowDefinition.model_validate(r.definition)
+            if (
+                definition.trigger.type == TriggerType.EVENT
+                and definition.trigger.event_name == event_name
+            ):
+                out.append((r.flow.tenant_id, definition))
+        return out
+
     # ------------------------------------------------------------------
     # Runs
     # ------------------------------------------------------------------
@@ -215,7 +249,7 @@ class WorkflowStore:
                 record.error = run.error
                 record.finished_at = run.finished_at
 
-            for sid, srun in run.steps.items():
+            for sid, srun in list(run.steps.items()):
                 s_res = await session.execute(
                     select(FlowStepRecord).where(
                         FlowStepRecord.run_id == run.run_id,
@@ -260,11 +294,11 @@ class WorkflowStore:
         async with self._db.session() as session:
             stmt = (
                 select(FlowRunRecord, FlowRecord.name, FlowVersionRecord.version_tag)
-                .join(
+                .outerjoin(
                     FlowVersionRecord,
                     FlowRunRecord.version_id == FlowVersionRecord.id,
                 )
-                .join(FlowRecord, FlowVersionRecord.flow_id == FlowRecord.id)
+                .outerjoin(FlowRecord, FlowVersionRecord.flow_id == FlowRecord.id)
                 .where(FlowRunRecord.run_id == run_id)
             )
             result = await session.execute(stmt)
