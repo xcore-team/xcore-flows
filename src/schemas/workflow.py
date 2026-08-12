@@ -197,8 +197,16 @@ class ForeachStep(_StepBase):
 class TransformStep(_StepBase):
     id: str
     type: Literal[StepType.TRANSFORM] = StepType.TRANSFORM
-    query: str = Field(description="Requête JQ ou expression de transformation")
-    input: Optional[str] = None
+    query: str = Field(
+        description=(
+            "Requête JMESPath (ex: '.tenant' ou 'tenant[0].id'), évaluée contre "
+            "`input` (ou le contexte complet si `input` est absent). Une query "
+            "purement '{{ ... }}' reste résolue via le moteur de templates."
+        )
+    )
+    input: Optional[str] = Field(
+        default=None, description="Template {{ ... }} résolu pour produire le document sur lequel `query` s'exécute"
+    )
     on_success: Optional[str] = None
     description: Optional[str] = None
 

@@ -10,6 +10,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol
 
+import jmespath
+from jmespath.exceptions import JMESPathError
+
 from .condition import evaluate_condition, render_payload, render_value
 from .retry import RetryExhausted, execute_with_retry
 from ..repositories.workflow import WorkflowStore
@@ -81,7 +84,6 @@ class WorkflowEngine:
             trigger_payload=trigger_payload or {},
             context={
                 "trigger": trigger_payload or {},
-                "_visited": [],
                 "_triggered_by": trigger_type,
             },
             started_at=datetime.now(timezone.utc),
@@ -117,9 +119,18 @@ class WorkflowEngine:
 
     async def _execute(self, definition: WorkflowDefinition, run: WorkflowRun) -> None:
         timeout = definition.timeout_seconds
+        # Snapshot figé AVANT de commencer à exécuter : seuls les steps déjà
+        # SUCCESS suite à un crash d'un précédent appel (reprise) doivent être
+        # sautés. Sans ce gel, un step relancé plusieurs fois dans le MÊME
+        # appel (boucle foreach, branches parallel) passerait SUCCESS dès la
+        # 1ʳᵉ occurrence et toutes les suivantes seraient silencieusement
+        # sautées — la boucle n'agirait alors qu'une seule fois.
+        resumed_success_ids = frozenset(
+            sid for sid, step_run in run.steps.items() if step_run.status == StepStatus.SUCCESS
+        )
         try:
             start_id = run.current_step_id or definition.start_step_id
-            coro = self._run_from_step(definition, run, start_id)
+            coro = self._run_from_step(definition, run, start_id, resumed_success_ids=resumed_success_ids)
             if timeout:
                 await asyncio.wait_for(coro, timeout=timeout)
             else:
@@ -158,8 +169,17 @@ class WorkflowEngine:
         definition: WorkflowDefinition,
         run: WorkflowRun,
         step_id: str,
+        visited: Optional[List[str]] = None,
+        resumed_success_ids: "frozenset[str]" = frozenset(),
     ) -> None:
-        visited: List[str] = run.context.get("_visited", [])
+        # `visited` est propre à ce chemin d'exécution (copié, jamais partagé
+        # avec l'appelant) : une branche de parallel ou une itération de
+        # foreach démarre sa propre traçabilité de cycle à partir de l'état
+        # au moment où elle est lancée, sans hériter des passages faits par
+        # les autres branches/itérations. Ça permet de revisiter légitimement
+        # le même step_id (boucle, branches convergentes) tout en détectant
+        # toujours un vrai cycle A→B→A à l'intérieur d'un même chemin.
+        visited = list(visited) if visited is not None else []
         current_id: Optional[str] = step_id
 
         while current_id and current_id != END:
@@ -167,7 +187,6 @@ class WorkflowEngine:
             if current_id in visited:
                 raise RuntimeError(f"Cycle détecté au step '{current_id}'")
             visited.append(current_id)
-            run.context["_visited"] = visited
 
             if run.status == WorkflowStatus.CANCELLED:
                 logger.info("Run %s annulé à l'étape '%s'", run.run_id, current_id)
@@ -180,7 +199,7 @@ class WorkflowEngine:
             run.current_step_id = current_id
             await self._save_run(run)
 
-            current_id = await self._dispatch_step(definition, run, step)
+            current_id = await self._dispatch_step(definition, run, step, visited, resumed_success_ids)
 
     # ------------------------------------------------------------------
     # Step dispatcher
@@ -191,13 +210,14 @@ class WorkflowEngine:
         definition: WorkflowDefinition,
         run: WorkflowRun,
         step: AnyStep,
+        visited: List[str],
+        resumed_success_ids: "frozenset[str]",
     ) -> Optional[str]:
-        # Crash recovery : si le step est déjà SUCCESS, passer au suivant
-        if (
-            step.id in run.steps
-            and run.steps[step.id].status == StepStatus.SUCCESS
-            and hasattr(step, "on_success")
-        ):
+        # Crash recovery : un step déjà SUCCESS avant le début de CET appel
+        # (reprise après crash) est sauté. Un step re-SUCCESS pendant le
+        # déroulement de cet appel (itération de foreach, branche parallel)
+        # n'est PAS dans ce snapshot figé — il est donc bien ré-exécuté.
+        if step.id in resumed_success_ids and hasattr(step, "on_success"):
             return getattr(step, "on_success", None) or END
 
         if isinstance(step, ActionStep):
@@ -205,11 +225,11 @@ class WorkflowEngine:
         if isinstance(step, ConditionStep):
             return await self._run_condition(run, step)
         if isinstance(step, ParallelStep):
-            return await self._run_parallel(definition, run, step)
+            return await self._run_parallel(definition, run, step, visited, resumed_success_ids)
         if isinstance(step, SwitchStep):
             return await self._run_switch(run, step)
         if isinstance(step, ForeachStep):
-            return await self._run_foreach(definition, run, step)
+            return await self._run_foreach(definition, run, step, visited, resumed_success_ids)
         if isinstance(step, WaitStep):
             return await self._run_wait(run, step)
         if isinstance(step, TransformStep):
@@ -272,9 +292,16 @@ class WorkflowEngine:
         await self._save_run(run)
         return (step.if_true if met else step.if_false) or END
 
-    async def _run_parallel(self, definition: WorkflowDefinition, run: WorkflowRun, step: ParallelStep) -> str:
+    async def _run_parallel(
+        self,
+        definition: WorkflowDefinition,
+        run: WorkflowRun,
+        step: ParallelStep,
+        visited: List[str],
+        resumed_success_ids: "frozenset[str]",
+    ) -> str:
         tasks = [
-            self._run_from_step(definition, run, branch[0])
+            self._run_from_step(definition, run, branch[0], visited, resumed_success_ids)
             for branch in step.branches
             if branch
         ]
@@ -297,7 +324,14 @@ class WorkflowEngine:
         await self._save_run(run)
         return step.cases.get(val, step.default) or END
 
-    async def _run_foreach(self, definition: WorkflowDefinition, run: WorkflowRun, step: ForeachStep) -> str:
+    async def _run_foreach(
+        self,
+        definition: WorkflowDefinition,
+        run: WorkflowRun,
+        step: ForeachStep,
+        visited: List[str],
+        resumed_success_ids: "frozenset[str]",
+    ) -> str:
         context = self._build_context(run)
         items = render_value(step.items, context)
         if not isinstance(items, list):
@@ -309,14 +343,17 @@ class WorkflowEngine:
             async def run_item(item: Any) -> None:
                 async with sem:
                     run.context["loop_item"] = item
-                    await self._run_from_step(definition, run, step.steps[0])
+                    # Chaque item repart de l'état `visited` figé à l'entrée
+                    # de la boucle : la ré-exécution de step.steps[0] à
+                    # chaque itération n'est pas un cycle.
+                    await self._run_from_step(definition, run, step.steps[0], visited, resumed_success_ids)
 
             await asyncio.gather(*[run_item(item) for item in items], return_exceptions=True)
         else:
             for item in items:
                 run.context["loop_item"] = item
                 if step.steps:
-                    await self._run_from_step(definition, run, step.steps[0])
+                    await self._run_from_step(definition, run, step.steps[0], visited, resumed_success_ids)
 
         run.context.pop("loop_item", None)
         return step.on_success or END
@@ -328,7 +365,24 @@ class WorkflowEngine:
 
     async def _run_transform(self, run: WorkflowRun, step: TransformStep) -> str:
         context = self._build_context(run)
-        result = render_value(step.query, context)
+        query = step.query.strip()
+
+        # Compat : une query purement "{{ ... }}" reste résolue par le
+        # même moteur de templates que les autres steps (aucun changement
+        # de comportement pour les workflows existants qui l'utilisaient
+        # ainsi, sans vraie syntaxe JMESPath).
+        if query.startswith("{{") and query.endswith("}}"):
+            result = render_value(step.query, context)
+        else:
+            source = render_value(step.input, context) if step.input is not None else context
+            expression = query[1:] if query.startswith(".") else query
+            try:
+                result = jmespath.search(expression, source) if expression else source
+            except JMESPathError as exc:
+                raise ValueError(
+                    f"Requête JMESPath invalide dans le step '{step.id}' ({query!r}) : {exc}"
+                ) from exc
+
         run.context.setdefault("steps", {})[step.id] = {"result": result}
         await self._save_run(run)
         return step.on_success or END

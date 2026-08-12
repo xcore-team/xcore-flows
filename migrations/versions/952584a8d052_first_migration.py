@@ -11,7 +11,7 @@ la migration suivante (b3f1c2e4d891) avec le nouveau schéma.
 from typing import Sequence, Union
 
 import sqlalchemy as sa
-from alembic import op
+from alembics import op
 
 revision: str = '952584a8d052'
 down_revision: Union[str, Sequence[str], None] = None
