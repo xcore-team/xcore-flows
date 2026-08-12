@@ -1,5 +1,5 @@
 
-from alembic import context
+from alembics import context
 from app.xflows.src.repositories import *  # noqa: F401,F403 — registers all models in Base.metadata
 
 target_metadata = Base.metadata
