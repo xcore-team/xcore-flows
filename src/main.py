@@ -85,11 +85,7 @@ class Plugin(RoutedPlugin, AutoDispatchMixin, TrustedBase):
 
         # Service WebSocket temps réel (optionnel — absent en tests/déploiements sans WS).
         # Même convention que xcompany/tasks : canal "xflow" déclaré dans integration.yaml.
-        self._ws = (
-            self.get_service("ext.websocket")
-            if self.ctx.has_service("ext.websocket")
-            else None
-        )
+        self._ws = self.get_service("ext.websocket")
         if self._ws is None:
             logger.info("Service WebSocket absent — diffusion temps réel désactivée.")
 
