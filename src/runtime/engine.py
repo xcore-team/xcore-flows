@@ -57,8 +57,55 @@ class WorkflowEngine:
         self.plugin = plugin
         self.ctx = plugin.ctx
         self._store: Optional[WorkflowStore] = None
+        # Droits RÉSOLUS d'un run, le temps de ce run seulement. On ne stocke jamais de permissions (ni ici de façon durable,
+        # ni en base) : le run ne retient que l'IDENTIFIANT de son déclencheur (`context._actor_sub`), et ses droits sont
+        # redemandés à xauth à chaque exécution. Un compte parti ou un grant retiré arrête donc le travail, au lieu de le
+        # laisser courir avec les droits d'hier — et un run repris après un redémarrage, ou exécuté dans un autre processus,
+        # retrouve son identité tout seul.
+        self._resolved: Dict[str, Dict[str, Any]] = {}
         # Sera injecté par le plugin parent pour le scheduler
         self._enqueue_run_id: Optional[Callable] = None
+
+    AUTH_PLUGIN = "auth"
+    ACTOR_KEY = "_actor_sub"
+
+    async def _principal(self, run: WorkflowRun) -> Optional[Dict[str, Any]]:
+        """Les droits du run : ceux que son déclencheur a MAINTENANT, demandés à xauth une fois par run.
+
+        `None` quand le run n'a pas d'identité (aucun déclencheur connu) ou que xauth ne la reconnaît plus : le plugin appelé
+        refusera alors de lui-même, ce qui est le bon sens de l'échec.
+        """
+        cached = self._resolved.get(run.run_id)
+        if cached is not None:
+            return cached or None
+        sub = (run.context or {}).get(self.ACTOR_KEY)
+        caller = getattr(self.ctx, "caller", None)
+        if not sub or caller is None:
+            self._resolved[run.run_id] = {}
+            return None
+        try:
+            answer = await caller(
+                self.AUTH_PLUGIN,
+                "xauth.user.permissions",
+                {"user_id": sub, "tenant_id": run.tenant_id},
+                caller=self.ctx.name,
+                tenant_id=run.tenant_id,
+                principal=None,
+            )
+        except Exception as exc:  # noqa: BLE001 - xauth absent ou injoignable : le run échouera sur le refus du plugin appelé
+            logger.warning("xflow: identité non résolue pour le run %s : %s", run.run_id, exc)
+            answer = None
+        perms = (answer or {}).get("permissions") if isinstance(answer, dict) else None
+        if not isinstance(perms, list):
+            logger.warning("xflow: xauth ne reconnaît plus %s (run %s)", sub, run.run_id)
+            self._resolved[run.run_id] = {}
+            return None
+        principal = {"sub": sub, "permissions": perms, "user": {"id": sub, "tenant_id": run.tenant_id}}
+        self._resolved[run.run_id] = principal
+        return principal
+
+    def forget_actor(self, run_id: str) -> None:
+        self._resolved.pop(run_id, None)
 
     async def setup(self, store: WorkflowStore) -> None:
         self._store = store
@@ -93,6 +140,12 @@ class WorkflowEngine:
 
     async def execute_existing(self, definition: WorkflowDefinition, run: WorkflowRun) -> None:
         """Exécute un run déjà initialisé (appelé depuis le worker)."""
+        try:
+            await self._execute_existing(definition, run)
+        finally:
+            self.forget_actor(run.run_id)  # l'identité ne survit pas au run
+
+    async def _execute_existing(self, definition: WorkflowDefinition, run: WorkflowRun) -> None:
         run.status = WorkflowStatus.RUNNING
         await self._save_run(run)
         await self._emit("workflow.started", run)
@@ -244,6 +297,31 @@ class WorkflowEngine:
     # Step implementations
     # ------------------------------------------------------------------
 
+    async def _call(self, plugin_name: str, action: str, payload: dict, run: WorkflowRun) -> Dict[str, Any]:
+        """Appelle l'action d'un autre plugin AU NOM du run : son organisation, et l'identité de son déclencheur.
+
+        `call_plugin` du SDK déduit le tenant et le principal des ContextVar de la requête en cours. C'est juste quand le step
+        tourne pendant une requête (déclenchement manuel), et faux partout ailleurs : un run repris de la file, relancé après un
+        crash ou déclenché par cron n'a plus de requête, donc plus de tenant (repli silencieux sur « default ») ni d'identité.
+        Or le run, lui, SAIT dans quelle organisation il tourne. On passe donc les deux explicitement.
+
+        L'identité n'est jamais stockée dans le run (ce serait stocker une capacité : un run rejoué agirait avec les droits de
+        quelqu'un parti depuis). Tant qu'il n'y a pas de compte de service, un run hors requête part sans principal, et le plugin
+        appelé refuse lui-même s'il exige une identité — c'est le bon sens de l'échec, pas un contournement à inventer ici.
+        """
+        caller = getattr(self.ctx, "caller", None)
+        if caller is None:  # plugin sandboxé ou test sans caller : on garde le chemin d'origine
+            return await self.plugin.call_plugin(plugin_name=plugin_name, action=action, payload=payload)
+        principal = await self._principal(run)
+        return await caller(
+            plugin_name,
+            action,
+            payload or {},
+            caller=self.ctx.name,
+            tenant_id=run.tenant_id,
+            principal=principal,
+        )
+
     async def _run_action(self, definition: WorkflowDefinition, run: WorkflowRun, step: ActionStep) -> str:
         step_run = self._get_or_create_step_run(run, step.id)
         step_run.status = StepStatus.RUNNING
@@ -254,12 +332,7 @@ class WorkflowEngine:
         context = self._build_context(run)
         payload = render_payload(step.payload, context)
         async def call_action() -> dict:
-            reponse =  await self.plugin.call_plugin(
-                plugin_name=step.plugin,
-                action=step.action,
-                payload=payload
-            )
-            return reponse
+            return await self._call(step.plugin, step.action, payload, run)
 
         try:
             result = await execute_with_retry(call_action, step.retry)

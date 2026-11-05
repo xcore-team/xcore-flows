@@ -12,6 +12,7 @@ from .models import (
     FlowDeadJobRecord,
     FlowRecord,
     FlowRunRecord,
+    FlowScheduleRecord,
     FlowStepRecord,
     FlowVersionRecord,
 )
@@ -130,7 +131,17 @@ class WorkflowStore:
             flow = result.scalar_one_or_none()
             if flow is None:
                 return False
-            await session.delete(flow)
+            # Un flux qui a déjà TOURNÉ : ses exécutions pointent vers ses versions, et `session.delete(flow)` faisait détacher ces
+            # exécutions par SQLAlchemy — un chargement paresseux, impossible en asynchrone (500 à la suppression, mesuré depuis le
+            # Desk). On retire donc explicitement, dans l'ordre des clés, les étapes, les exécutions, les planifications et les
+            # versions, puis le flux : supprimer une automatisation retire aussi son historique.
+            versions = select(FlowVersionRecord.id).where(FlowVersionRecord.flow_id == flow.id)
+            runs = select(FlowRunRecord.run_id).where(FlowRunRecord.version_id.in_(versions))
+            await session.execute(delete(FlowStepRecord).where(FlowStepRecord.run_id.in_(runs)))
+            await session.execute(delete(FlowRunRecord).where(FlowRunRecord.version_id.in_(versions)))
+            await session.execute(delete(FlowScheduleRecord).where(FlowScheduleRecord.flow_id == flow.id))
+            await session.execute(delete(FlowVersionRecord).where(FlowVersionRecord.flow_id == flow.id))
+            await session.execute(delete(FlowRecord).where(FlowRecord.id == flow.id))
             await session.commit()
 
         if self._cache:

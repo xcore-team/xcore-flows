@@ -7,12 +7,71 @@ description: >
 execution_mode: trusted
 framework_version: ">=2.0"
 entry_point: src/main.py
+# ACL IPC plugin-à-plugin : absent ou [] = TOUT refuser (ipc_denied). xcore-doctype lance les flux d'une transition
+# (`flow:` dans le workflow d'un DocType) et les modules lancent les leurs : tout plugin de confiance (il est déjà dans
+# le processus). Un opérateur qui veut restreindre nomme ici les plugins permis — sans oublier xcore-doctype.
+allowed_callers: ["*"]
 
-requires:
-  - name: auth
-    version: 1.0.0
+# auth AVANT (rbac.declare), sans contrainte de version (xauth et l'auth de test n'ont pas la même numérotation) ;
+# xcore-doctype aussi : les étapes des flux appellent ses actions `doc.*`.
+requires: [auth]
 
+# Les actions d'xflow n'ont PAS de préfixe (`trigger`, `deploy`, `list_workflows`…) : les ressources `xflow.trigger` &co ci-dessous
+# ne couvraient donc aucune d'elles, et xcore répondait `permission_denied` à chaque appel (mesuré : le flux d'une transition ne
+# partait jamais). Elles sont ouvertes par leurs vrais noms ; la garde est ailleurs — l'organisation de l'appel doit être celle de la
+# charge utile (`Plugin.handle`), et les droits d'un run sont ceux de son déclencheur, redemandés à xauth.
 permissions:
+  - resource: "register"
+    actions: ["execute"]
+    effect: allow
+  - resource: "deploy"
+    actions: ["execute"]
+    effect: allow
+  - resource: "unregister"
+    actions: ["execute"]
+    effect: allow
+  - resource: "run"
+    actions: ["execute"]
+    effect: allow
+  - resource: "trigger"
+    actions: ["execute"]
+    effect: allow
+  - resource: "webhook.*"
+    actions: ["execute"]
+    effect: allow
+  - resource: "get_run"
+    actions: ["execute"]
+    effect: allow
+  - resource: "executions"
+    actions: ["execute"]
+    effect: allow
+  - resource: "list_runs"
+    actions: ["execute"]
+    effect: allow
+  - resource: "cancel_run"
+    actions: ["execute"]
+    effect: allow
+  - resource: "pause"
+    actions: ["execute"]
+    effect: allow
+  - resource: "list_workflows"
+    actions: ["execute"]
+    effect: allow
+  - resource: "registry"
+    actions: ["execute"]
+    effect: allow
+  - resource: "ai_generate"
+    actions: ["execute"]
+    effect: allow
+  - resource: "xflow_integration"
+    actions: ["execute"]
+    effect: allow
+  - resource: "composite.*"
+    actions: ["execute"]
+    effect: allow
+  - resource: "events.*"
+    actions: ["execute"]
+    effect: allow
   - resource: "xflow.integration"
     actions: ['*']
     effect: allow
@@ -55,31 +114,37 @@ rbac:
     - name: xflow:workflows:read
       description: "Consulter la liste et le détail des workflows"
       tenant_grantable: true
+      default_roles: [tenant_admin]
       group: xflow
 
     - name: xflow:workflows:write
       description: "Déployer et supprimer des workflows"
       tenant_grantable: true
+      default_roles: [tenant_admin]
       group: xflow
 
     - name: xflow:runs:read
       description: "Consulter les exécutions et leur état"
       tenant_grantable: true
+      default_roles: [tenant_admin]
       group: xflow
 
     - name: xflow:runs:write
       description: "Déclencher, annuler et relancer des runs"
       tenant_grantable: true
+      default_roles: [tenant_admin]
       group: xflow
 
     - name: xflow:composites:read
       description: "Consulter les nœuds composites"
       tenant_grantable: true
+      default_roles: [tenant_admin]
       group: xflow
 
     - name: xflow:composites:write
       description: "Créer et supprimer des nœuds composites"
       tenant_grantable: true
+      default_roles: [tenant_admin]
       group: xflow
 
     - name: xflow:admin

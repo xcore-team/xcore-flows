@@ -110,10 +110,16 @@ class TriggerConfig(_StepBase):
     type: TriggerType = TriggerType.MANUAL
     event_name: Optional[str] = None
     webhook_path: Optional[str] = None
+    # Obsolète et ignoré : le secret de signature est géré côté serveur (table dédiée).
     webhook_secret: Optional[str] = None
     cron: Optional[str] = None
     interval_seconds: Optional[int] = None
     initial_payload: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("webhook_secret", mode="before")
+    @classmethod
+    def _drop_legacy_secret(cls, _v: Any) -> None:
+        return None
 
 
 class WebhookNotification(BaseModel):
@@ -277,6 +283,9 @@ class WorkflowDefinition(BaseModel):
     webhooks: List[WebhookNotification] = Field(default_factory=list)
     timeout_seconds: Optional[float] = None
     tags: List[str] = Field(default_factory=list)
+    # Identifiant de celui qui a déployé ce workflow. Un déclenchement planifié n'a pas d'humain derrière lui : il s'exécute
+    # avec les droits de cette personne, RELUS à chaque exécution. Jamais de permissions ici, seulement un identifiant.
+    deployed_by: Optional[str] = None
 
     @field_validator("steps", mode="before")
     @classmethod

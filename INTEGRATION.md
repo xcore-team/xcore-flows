@@ -255,7 +255,7 @@ Retourne le catalogue d'événements découverts.
 | `GET` | `/events` | Catalogue d'événements |
 | `POST` | `/events/refresh` | Rafraîchir le catalogue |
 
-> **Webhook public** : l'endpoint `/webhook/{name}` accepte uniquement les workflows dont le trigger est `webhook` ou `manual`.
+> **Webhook signé** : `/webhook/{name}?tenant_id=` accepte uniquement les workflows `webhook` ou `manual` disposant d'un secret, avec les en-têtes `X-XFlow-Timestamp` et `X-XFlow-Signature` (voir `docs/security.md`).
 
 ---
 
@@ -466,12 +466,11 @@ Déclenché automatiquement lorsqu'un événement est émis sur l'EventBus.
 
 ### `webhook`
 
-Déclenché via `POST /webhook/{workflow_name}`. Le corps de la requête est passé comme `trigger`.
+Déclenché via `POST /webhook/{workflow_name}?tenant_id=...` (requête signée, voir `docs/security.md`). Le corps de la requête est passé comme `trigger`.
 
 ```json
 {
-  "type": "webhook",
-  "webhook_secret": "mon_secret_optionnel"
+  "type": "webhook"
 }
 ```
 

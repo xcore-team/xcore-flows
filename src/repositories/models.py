@@ -30,6 +30,24 @@ class FlowRecord(Base):
     versions: Mapped[list["FlowVersionRecord"]] = relationship(back_populates="flow", cascade="all, delete-orphan")
 
 
+class WebhookSecretRecord(Base):
+    """Secret de signature des webhooks entrants, par (tenant, workflow).
+
+    `secret_value` est préfixé `enc:` (Fernet, clé XFLOW_WEBHOOK_KEK) ou `plain:`.
+    Jamais inclus dans la définition du workflow ni dans une réponse de lecture.
+    """
+
+    __tablename__ = "xflow_webhook_secrets"
+    __table_args__ = (UniqueConstraint("tenant_id", "workflow_name", name="uq_xflow_webhook_secrets"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    workflow_name: Mapped[str] = mapped_column(String(255))
+    secret_value: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    rotated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class FlowVersionRecord(Base):
     __tablename__ = "xflow_versions"
 
